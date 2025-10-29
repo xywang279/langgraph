@@ -106,7 +106,10 @@ export default function Chat() {
     const userMessage = { id: uid(), role: 'user', content: text }
     const aiPlaceholder = { id: 'ai-live', role: 'ai', content: '' }
 
-    setItems((prev) => [...prev, userMessage, aiPlaceholder])
+    setItems((prev) => {
+      const withoutLive = prev.filter((item) => item.id !== 'ai-live')
+      return [...withoutLive, userMessage, aiPlaceholder]
+    })
     setText('')
 
     es.onmessage = (ev) => {
@@ -118,11 +121,14 @@ export default function Chat() {
           es.close()
           esRef.current = null
           setItems((prev) =>
-            prev.filter(
-              (item) =>
-                item.id !== 'ai-live' ||
-                (item.content && item.content.trim().length > 0)
-            )
+            prev.flatMap((item) => {
+              if (item.id !== 'ai-live') return [item]
+              const textContent = (item.content || '').trim()
+              if (!textContent) {
+                return []
+              }
+              return [{ ...item, id: uid(), content: textContent }]
+            })
           )
           return
         }
@@ -180,6 +186,7 @@ export default function Chat() {
       setLoading(false)
       es.close()
       esRef.current = null
+      setItems((prev) => prev.filter((item) => item.id !== 'ai-live'))
     }
   }
 
@@ -188,6 +195,7 @@ export default function Chat() {
       esRef.current.close()
       esRef.current = null
       setLoading(false)
+      setItems((prev) => prev.filter((item) => item.id !== 'ai-live'))
     }
   }
 

@@ -10,7 +10,6 @@ from typing import Dict, List
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-
 # ---- 安全四则运算（结构化参数） ----
 _OPS = {
     ast.Add: op.add,
@@ -29,7 +28,7 @@ class CalcArgs(BaseModel):
 
 
 def _eval_ast(node: ast.AST) -> float:
-    # 兼容 Python 3.8 之后的 ast.Constant 以及旧版 ast.Num
+    # 兼容 Python 3.8+ 的 ast.Constant 以及旧版 ast.Num
     if isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return node.value
@@ -52,7 +51,7 @@ def calc(expression: str) -> str:
     try:
         node = ast.parse(expression, mode="eval").body
         return str(_eval_ast(node))
-    except Exception as exc:  # pragma: no cover - 小型示例无需单测
+    except Exception as exc:  # pragma: no cover - 示例无需覆盖
         return f"ERROR: {exc}"
 
 
@@ -95,6 +94,33 @@ def _kb_lookup(query: str) -> str:
 def kb_search(query: str) -> str:
     """本地知识库检索，适合兜底或快速查找内置资料。"""
     return _kb_lookup(query)
+
+
+_FAQ: Dict[str, str] = {
+    "LangGraph 是什么": "LangGraph 是一个针对有状态 Agent 的编排框架，支持图式执行、循环控制与持久化存储。",
+    "工具降级如何提示": "在工具失败后，observation 字段会写明失败原因以及是否触发 fallback。",
+    "并行工具会不会阻塞": "tool_orchestrator 会依据 priority 和 exclusive 配置决定是否并发执行，默认可并发的工具不会互相阻塞。",
+}
+
+
+class FaqArgs(BaseModel):
+    question: str = Field(..., description="Question to lookup in local FAQ store.")
+
+
+def _faq_lookup(question: str) -> str:
+    q = question.strip().lower()
+    if not q:
+        return "请输入有效的问题。"
+    for key, value in _FAQ.items():
+        if q in key.lower():
+            return f"{key}：{value}"
+    return "未命中本地 FAQ，可改用 multi_search 获取更多信息。"
+
+
+@tool("faq", args_schema=FaqArgs)
+def faq(question: str) -> str:
+    """本地 FAQ 检索，适合快速回答常见问题。"""
+    return _faq_lookup(question)
 
 
 class MultiSearchArgs(BaseModel):
@@ -151,8 +177,8 @@ class UnstableArgs(BaseModel):
 @tool("unstable", args_schema=UnstableArgs)
 def unstable(task: str, seconds: float = 3.0, fail: bool = False) -> str:
     """
-    一个“可能很慢/会失败”的工具：sleep seconds 后返回。
-    设置 fail=True 模拟异常。用于验证超时/重试/降级路径。
+    一个“可能很慢 / 会失败”的工具：sleep seconds 后返回。
+    设置 fail=True 模拟异常。用于验证超时 / 重试 / 降级路径。
     """
     time.sleep(max(0.0, float(seconds)))
     if fail:
