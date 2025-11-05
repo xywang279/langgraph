@@ -1,15 +1,43 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from typing import Any, Dict
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.types import Interrupt
 from pydantic import BaseModel
 
-from .graph import compiled_graph
+from .graph import build_step_instruction, compiled_graph
+
+_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "app.log"
+
+logger = logging.getLogger(__name__)
+if not any(
+    isinstance(handler, RotatingFileHandler)
+    and getattr(handler, "baseFilename", None) == str(_LOG_FILE)
+    for handler in logger.handlers
+):
+    file_handler = RotatingFileHandler(
+        _LOG_FILE,
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logger.addHandler(file_handler)
+logger.setLevel(logging.INFO)
+
+
 
 app = FastAPI(title="LangGraph Agent · Tool Orchestration Demo")
 
@@ -31,19 +59,15 @@ class ChatResp(BaseModel):
     reply: str
 
 
-@app.post("/chat", response_model=ChatResp)
-def chat(body: ChatReq) -> ChatResp:
-    """单次对话：根据 session_id 复用持久化上下文。"""
-    result = compiled_graph.invoke(
-        {"messages": [HumanMessage(content=body.message)]},
-        config={"configurable": {"thread_id": body.session_id}},
-    )
-    reply = "（暂未生成回复）"
-    for message in reversed(result["messages"]):
-        if getattr(message, "type", None) == "ai":
-            reply = message.content
-            break
-    return ChatResp(reply=reply)
+pending_interrupts: Dict[str, Dict[str, Any]] = {}
+
+
+def _register_interrupt(session_id: str, payload: Dict[str, Any]) -> None:
+    pending_interrupts[session_id] = payload
+
+
+def _clear_interrupt(session_id: str) -> None:
+    pending_interrupts.pop(session_id, None)
 
 
 def _normalize_tool_payload(content: Any, tool_name: str) -> Dict[str, Any]:
@@ -70,13 +94,128 @@ def _normalize_tool_payload(content: Any, tool_name: str) -> Dict[str, Any]:
     return payload
 
 
+def _to_serializable(value: Any) -> Any:
+    if isinstance(value, Interrupt):
+        return {
+            "value": _to_serializable(value.value),
+            "when": getattr(value, "when", "during"),
+        }
+    if isinstance(value, dict):
+        return {k: _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_serializable(v) for v in value]
+    return value
+
+
+def _format_stream_payloads(
+    node: str,
+    data: Any,
+    session_id: str,
+    ai_state: Dict[str, str],
+) -> Iterable[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        yield {"event": node, "data": data}
+        return
+
+    if "__interrupt__" in data:
+        for interrupt in data["__interrupt__"]:
+            payload = getattr(interrupt, "value", interrupt)
+            if isinstance(payload, dict):
+                _register_interrupt(session_id, payload)
+            yield {"event": "interrupt", "node": node, "payload": payload}
+        return
+
+    plan = data.get("plan")
+    if plan is not None:
+        event: Dict[str, Any] = {"event": "plan", "plan": plan, "node": node}
+        if "current_step" in data:
+            event["current_step"] = data["current_step"]
+        if "active_step_id" in data:
+            event["active_step_id"] = data["active_step_id"]
+        yield event
+
+    if data.get("pending_interrupt"):
+        payload = data["pending_interrupt"]
+        if isinstance(payload, dict):
+            _register_interrupt(session_id, payload)
+        yield {"event": "interrupt", "node": node, "payload": payload}
+    elif "pending_interrupt" in data and session_id in pending_interrupts:
+        _clear_interrupt(session_id)
+
+    if data.get("last_step_update"):
+        yield {
+            "event": "step_update",
+            "node": node,
+            "payload": data["last_step_update"],
+        }
+
+    if "status" in data:
+        yield {"event": "status", "node": node, "status": data["status"]}
+
+    if "messages" in data:
+        for msg_obj in data["messages"]:
+            role = getattr(msg_obj, "type", None) or "unknown"
+            content = getattr(msg_obj, "content", "")
+            payload: Dict[str, Any] = {"event": node}
+
+            if role == "ai" and isinstance(content, str):
+                previous = ai_state.get("full", "")
+                delta = content[len(previous) :] if content.startswith(previous) else content
+                ai_state["full"] = content
+                payload.update({"role": "ai", "delta": delta})
+            elif role == "tool":
+                tool_name = getattr(msg_obj, "name", "") or "tool"
+                tool_payload = _normalize_tool_payload(content, tool_name)
+                payload.update({"role": "tool", **tool_payload})
+            else:
+                payload.update({"role": role, "content": content})
+
+            yield payload
+
+    handled: Set[str] = {
+        "plan",
+        "pending_interrupt",
+        "last_step_update",
+        "status",
+        "messages",
+    }
+    extra = {
+        key: value
+        for key, value in data.items()
+        if key not in handled and not key.startswith("_")
+    }
+    if extra:
+        yield {"event": node, "payload": extra}
+
+
+@app.post("/chat", response_model=ChatResp)
+def chat(body: ChatReq) -> ChatResp:
+    logger.info("chat request session=%s message=%s", body.session_id, body.message)
+
+    result = compiled_graph.invoke(
+        {"messages": [HumanMessage(content=body.message)]},
+        config={"configurable": {"thread_id": body.session_id}},
+    )
+    logger.info(
+        "chat response session=%s messages=%s",
+        body.session_id,
+        len(result.get("messages", [])),
+    )
+    reply = "（暂未生成回复）"
+    for message in reversed(result["messages"]):
+        if getattr(message, "type", None) == "ai":
+            reply = message.content
+            break
+    return ChatResp(reply=reply)
+
+
 @app.get("/chat/stream")
 def chat_stream(session_id: str, message: str):
-    """SSE 流：返回节点事件，附带工具执行的可观测字段。"""
+    logger.info("chat stream session=%s message=%s", session_id, message)
 
     def event_gen():
         cfg = {"configurable": {"thread_id": session_id}}
-        ai_acc = ""
+        ai_state = {"full": ""}
         ended = False
         try:
             for update in compiled_graph.stream(
@@ -85,38 +224,19 @@ def chat_stream(session_id: str, message: str):
                 stream_mode="updates",
             ):
                 for node, data in update.items():
-                    payload: Dict[str, Any] = {"event": node}
-                    if isinstance(data, dict) and "messages" in data:
-                        for msg_obj in data["messages"]:
-                            role = getattr(msg_obj, "type", None) or "unknown"
-                            content = getattr(msg_obj, "content", "")
-                            payload = {"event": node}
-
-                            if role == "ai" and isinstance(content, str):
-                                if content.startswith(ai_acc):
-                                    delta = content[len(ai_acc) :]
-                                    ai_acc = content
-                                else:
-                                    delta = content
-                                    ai_acc = content
-                                payload.update({"role": "ai", "delta": delta})
-                            elif role == "tool":
-                                tool_name = getattr(msg_obj, "name", "") or "tool"
-                                tool_payload = _normalize_tool_payload(content, tool_name)
-                                payload.update({"role": "tool", **tool_payload})
-                            else:
-                                payload.update({"role": role, "content": content})
-
-                            yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-                        continue
-
-                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-        except Exception as exc:  # pragma: no cover - SSE 错误仅用于观测
+                    for chunk in _format_stream_payloads(node, data, session_id, ai_state):
+                        yield "data: " + json.dumps(_to_serializable(chunk), ensure_ascii=False) + "\n\n"
+        except Exception as exc:  # pragma: no cover - SSE 仅做演示
+            logger.exception(
+                "chat stream error session=%s message=%s exc=%s",
+                session_id,
+                message,
+                exc,
+            )
             if isinstance(exc, KeyError) and exc.args and exc.args[0] == "__end__":
                 yield 'data: {"event": "end"}\n\n'
                 ended = True
             elif isinstance(exc, RuntimeError) and str(exc) == "Connection error.":
-                # 客户端断开或连接中断，静默结束
                 yield 'data: {"event": "end"}\n\n'
                 ended = True
             else:
@@ -126,3 +246,133 @@ def chat_stream(session_id: str, message: str):
                 yield 'data: {"event": "end"}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.get("/chat/continue")
+def chat_continue(thread_id: str, action: str):
+    logger.info("resume request received thread=%s action=%s", thread_id, action)
+    verb = action.strip().lower()
+    if verb not in {"continue", "cancel"}:
+        raise HTTPException(status_code=400, detail="Unsupported action")
+
+    base_cfg = {"configurable": {"thread_id": thread_id}}
+    try:
+        snapshot = compiled_graph.get_state(base_cfg)
+    except ValueError as exc:  # no checkpoint available
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+
+    state_values = snapshot.values if isinstance(snapshot.values, dict) else {}
+    plan: List[Dict[str, Any]] = state_values.get("plan", [])  # type: ignore[assignment]
+    if not plan:
+        raise HTTPException(status_code=400, detail="No plan to resume")
+
+    current_step = state_values.get("current_step", 0)
+    if current_step >= len(plan):
+        raise HTTPException(status_code=400, detail="Plan already finished")
+
+    pending = pending_interrupts.get(thread_id) or state_values.get("pending_interrupt")
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending confirmation")
+
+    plan_copy = [dict(step) for step in plan]
+    step = dict(plan_copy[current_step])
+    updates: Dict[str, Any] = {
+        "plan": plan_copy,
+        "current_step": current_step,
+        "active_step_id": step.get("id"),
+    }
+
+    if verb == "cancel":
+        step["status"] = "cancelled"
+        updates["plan"][current_step] = step
+        updates["status"] = "cancelled"
+        updates["pending_interrupt"] = None
+        updates["last_step_update"] = {
+            "step_id": step.get("id"),
+            "status": "cancelled",
+        }
+        compiled_graph.update_state(base_cfg, updates, as_node="executor")
+        _clear_interrupt(thread_id)
+
+        def cancel_stream():
+            payload = {
+                "event": "cancelled",
+                "plan": updates["plan"],
+                "step_update": updates["last_step_update"],
+            }
+            yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            yield 'data: {"event": "end"}\n\n'
+
+        return StreamingResponse(cancel_stream(), media_type="text/event-stream")
+
+    instruction = (
+        step.get("prepared_instruction")
+        or pending.get("resume_instruction")
+        or build_step_instruction(step, current_step, len(plan_copy))
+    )
+    step["confirmed"] = True
+    step["status"] = "in_progress"
+    if instruction:
+        step["prepared_instruction"] = instruction
+    plan_copy[current_step] = dict(step)
+    updates["plan"] = [dict(item) for item in plan_copy]
+    updates["pending_interrupt"] = None
+    updates["status"] = "executing"
+    updates["last_step_update"] = {
+        "step_id": step.get("id"),
+        "status": "in_progress",
+        "action": "continue",
+    }
+    prompt_text = instruction or "继续执行当前步骤，保持节奏。"
+    updates["messages"] = [SystemMessage(content=f"[resume] {prompt_text}")]
+
+    logger.info(
+        "resume payload thread=%s step=%s keys=%s",
+        thread_id,
+        step.get("id"),
+        sorted(updates.keys()),
+    )
+    try:
+        resume_config = compiled_graph.update_state(base_cfg, updates, as_node="executor")
+        logger.info(
+            "resume accepted thread=%s step=%s new_config=%s",
+            thread_id,
+            step.get("id"),
+            resume_config,
+        )
+    except Exception:
+        logger.exception("resume failed thread=%s payload=%r", thread_id, updates)
+        raise
+    _clear_interrupt(thread_id)
+
+    def resume_stream():
+        ai_state = {"full": ""}
+        ended = False
+        try:
+            for update in compiled_graph.stream(
+                None,
+                config=resume_config,
+                stream_mode="updates",
+            ):
+                for node, data in update.items():
+                    for chunk in _format_stream_payloads(node, data, thread_id, ai_state):
+                        yield "data: " + json.dumps(_to_serializable(chunk), ensure_ascii=False) + "\n\n"
+        except Exception as exc:  # pragma: no cover
+            logger.exception(
+                "resume stream error thread=%s exc=%s",
+                thread_id,
+                exc,
+            )
+            if isinstance(exc, KeyError) and exc.args and exc.args[0] == "__end__":
+                yield 'data: {"event": "end"}\n\n'
+                ended = True
+            elif isinstance(exc, RuntimeError) and str(exc) == "Connection error.":
+                yield 'data: {"event": "end"}\n\n'
+                ended = True
+            else:
+                yield "data: " + json.dumps({"event": "error", "message": str(exc)}, ensure_ascii=False) + "\n\n"
+        finally:
+            if not ended:
+                yield 'data: {"event": "end"}\n\n'
+
+    return StreamingResponse(resume_stream(), media_type="text/event-stream")

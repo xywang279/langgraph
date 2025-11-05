@@ -1,20 +1,23 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Annotated, Dict, List, Literal, Optional, Set, TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import NodeInterrupt
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import MessagesState
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import tools_condition
+from pydantic import BaseModel, Field
 
 from .tools import calc, faq, kb_search, multi_search, now, unstable
 
@@ -30,6 +33,7 @@ llm = ChatOpenAI(model=MODEL, base_url=BASE_URL, api_key=API_KEY)
 TOOLS = [calc, now, kb_search, multi_search, faq, unstable]
 TOOL_REGISTRY = {tool.name: tool for tool in TOOLS}
 llm_with_tools = llm.bind_tools(TOOLS)
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "你是一名公众号写作助手。"
@@ -39,8 +43,14 @@ SYSTEM_PROMPT = (
     "生成最终回答前，务必整理所有工具结果并明确标注其来源。"
 )
 
+PLANNER_PROMPT = (
+    "请将用户的任务拆解为 3-5 个可执行步骤，"
+    "明确每一步需要产出的结果与可能使用的工具。"
+    "如果某一步需要用户确认才能继续，请将 requires_confirmation 置为 true。"
+    "返回 JSON 结构，供后续执行器使用。"
+)
 
-# ---- Tool arbitration configuration ----
+
 @dataclass(frozen=True)
 class ToolExecutionSpec:
     name: str
@@ -109,14 +119,92 @@ TOOL_HINTS = {
 }
 
 
-def _infer_required_tools(messages: List[AnyMessage]) -> List[str]:
+class PlanStepModel(BaseModel):
+    title: str = Field(..., description="步骤的标题")
+    description: str = Field(..., description="执行说明，描述要完成的具体子任务")
+    requires_confirmation: bool = Field(
+        False, description="若需要用户确认后再继续，请置为 true"
+    )
+    tool_names: List[str] = Field(
+        default_factory=list,
+        description="建议使用的内置工具名称列表，例如 calc、now、kb_search",
+    )
+
+
+class PlanOutline(BaseModel):
+    objective: str = Field(..., description="整体目标概述")
+    steps: List[PlanStepModel] = Field(..., min_length=1, max_length=6)
+
+
+StepStatus = Literal[
+    "pending",
+    "waiting",
+    "in_progress",
+    "completed",
+    "cancelled",
+    "failed",
+]
+
+
+class PlanStepState(TypedDict, total=False):
+    id: str
+    title: str
+    description: str
+    requires_confirmation: bool
+    tool_names: List[str]
+    status: StepStatus
+    result: str
+    confirmed: bool
+    result_message_id: Optional[str]
+    prepared_instruction: str
+
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[List[AnyMessage], add_messages]
+    plan: List[PlanStepState]
+    current_step: int
+    status: str
+    pending_interrupt: Optional[Dict[str, Any]]
+    active_step_id: Optional[str]
+    last_step_update: Optional[Dict[str, Any]]
+
+
+planner_llm = llm.with_structured_output(PlanOutline)
+
+FALLBACK_PLAN_BLUEPRINT: List[Dict[str, Any]] = [
+    {
+        "title": "确认文章标题与角度",
+        "description": "根据用户需求列出 1-2 个备选标题，请用户确认后再继续。",
+        "requires_confirmation": True,
+        "tool_names": ["faq"],
+    },
+    {
+        "title": "资料调研与要点整理",
+        "description": "利用 multi_search 或 kb_search 收集 LangGraph 最新进展与核心卖点，沉淀出 3-4 条写作提纲。",
+        "tool_names": ["multi_search", "kb_search"],
+    },
+    {
+        "title": "撰写正文草稿",
+        "description": "围绕确认后的标题与提纲，生成公众号风格正文（含小标题、数据或案例引用）。",
+        "tool_names": [],
+    },
+    {
+        "title": "校对与发布建议",
+        "description": "检查稿件逻辑、润色语言，并给出排版与配图提示。",
+        "tool_names": [],
+    },
+]
+
+
+
+def _extract_user_goal(messages: List[AnyMessage]) -> str:
     last_user: Optional[HumanMessage] = None
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             last_user = msg
             break
     if not last_user:
-        return []
+        return ""
 
     fragments: List[str] = []
     if isinstance(last_user.content, str):
@@ -132,13 +220,279 @@ def _infer_required_tools(messages: List[AnyMessage]) -> List[str]:
                 fragments.append(str(chunk))
     else:
         fragments.append(str(last_user.content))
+    return "\n".join(fragments).strip()
 
-    normalized = " ".join(fragments).lower()
-    required: List[str] = []
-    for tool_name, hints in TOOL_HINTS.items():
-        if any(hint.lower() in normalized for hint in hints):
-            required.append(tool_name)
-    return required
+
+def _clone_plan(plan: List[PlanStepState]) -> List[PlanStepState]:
+    return [dict(step) for step in plan]
+
+
+def build_step_instruction(step: PlanStepState, idx: int, total: int) -> str:
+    segments = [f"当前总计划进度：第 {idx + 1}/{total} 步。", f"目标：{step['title']}."]
+    if step.get("description"):
+        segments.append(f"说明：{step['description']}")
+    if step.get("tool_names"):
+        segments.append(
+            "建议优先尝试的工具：" + "、".join(step["tool_names"]) + "。"
+        )
+    segments.append("请完成本步骤需要的工作，并直接给出阶段性结果。")
+    return "\n".join(segments)
+
+
+def _find_latest_ai_message(
+    messages: List[AnyMessage],
+    exclude_ids: Optional[Set[str]] = None,
+) -> Optional[AIMessage]:
+    exclude_ids = exclude_ids or set()
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if msg.id and msg.id in exclude_ids:
+                continue
+            return msg
+    return None
+
+
+def planner(state: AgentState) -> AgentState:
+    messages = state.get("messages", [])
+    goal = _extract_user_goal(messages)
+    if not goal:
+        return {"status": "waiting_for_input"}
+
+    outline: Optional[PlanOutline]
+    planner_note: Optional[str] = None
+    try:
+        outline = planner_llm.invoke(
+            [
+                SystemMessage(content=PLANNER_PROMPT),
+                HumanMessage(content=goal),
+            ]
+        )
+    except Exception as exc:  # pragma: no cover - fallback only
+        logger.warning("Planner structured output failed: %s", exc)
+        planner_note = "Planner output could not be parsed; switched to a default four-step template."
+        objective = goal or "default objective"
+        fallback_steps = [
+            PlanStepModel(**step_blueprint) for step_blueprint in FALLBACK_PLAN_BLUEPRINT
+        ]
+        outline = PlanOutline(objective=objective, steps=fallback_steps[:4])
+
+    plan: List[PlanStepState] = []
+    for idx, step in enumerate(outline.steps, start=1):
+        plan.append(
+            {
+                "id": f"step-{idx}-{uuid.uuid4().hex[:6]}",
+                "title": step.title,
+                "description": step.description,
+                "requires_confirmation": step.requires_confirmation,
+                "tool_names": step.tool_names,
+                "status": "pending",
+                "result": "",
+                "confirmed": not step.requires_confirmation,
+            }
+        )
+
+    summary_text = (
+        f"Generated a {len(plan)} step execution plan: {outline.objective}\n"
+        "Steps will run sequentially with status updates at each stage."
+    )
+    messages_out: List[AnyMessage] = []
+    if planner_note:
+        messages_out.append(SystemMessage(content=f"[warning] {planner_note}"))
+    summary = SystemMessage(content=summary_text)
+    messages_out.append(summary)
+
+    if not plan:
+        status_value = "completed"
+    elif planner_note:
+        status_value = "planning_degraded"
+    else:
+        status_value = "planning_completed"
+
+    return {
+        "plan": plan,
+        "current_step": 0,
+        "status": status_value,
+        "pending_interrupt": None,
+        "active_step_id": plan[0]["id"] if plan else None,
+        "last_step_update": None,
+        "messages": messages_out,
+    }
+
+def executor(state: AgentState) -> AgentState:
+    plan = _clone_plan(state.get("plan", []))
+    idx = state.get("current_step", 0)
+    updates: AgentState = {
+        "plan": plan,
+        "current_step": idx,
+    }
+    logger.debug("executor invoked idx=%s total_steps=%s", idx, len(plan))
+
+    if not plan:
+        updates["status"] = "idle"
+        updates["active_step_id"] = None
+        updates["pending_interrupt"] = None
+        logger.debug("executor idle no-plan updates=%s", updates)
+        return updates
+
+    if idx >= len(plan):
+        updates["status"] = "completed"
+        updates["active_step_id"] = None
+        updates["pending_interrupt"] = None
+        logger.debug("executor already finished idx=%s", idx)
+        return updates
+
+    step = plan[idx]
+    if step.get("status") in {"completed", "cancelled", "failed"}:
+        next_idx = idx + 1
+        updates["current_step"] = next_idx
+        updates["status"] = "completed" if next_idx >= len(plan) else "executing"
+        updates["active_step_id"] = (
+            plan[next_idx]["id"] if next_idx < len(plan) else None
+        )
+        updates["pending_interrupt"] = None
+        logger.debug(
+            "executor step already terminal step_id=%s status=%s next_idx=%s",
+            step.get("id"),
+            step.get("status"),
+            next_idx,
+        )
+        return updates
+
+    if step.get("requires_confirmation") and not step.get("confirmed"):
+        instruction = build_step_instruction(step, idx, len(plan))
+        step["status"] = "waiting"
+        step["prepared_instruction"] = instruction
+        plan[idx] = step
+        pending_payload = {
+            "type": "confirmation",
+            "step_id": step["id"],
+            "title": step["title"],
+            "description": step.get("description", ""),
+            "message": f"请确认是否继续执行第 {idx + 1} 步：{step['title']}",
+            "options": ["continue", "cancel"],
+            "resume_instruction": instruction,
+        }
+        updates["plan"] = plan
+        updates["pending_interrupt"] = pending_payload
+        updates["status"] = "waiting"
+        updates["active_step_id"] = step["id"]
+        updates["last_step_update"] = {
+            "step_id": step["id"],
+            "status": "waiting",
+        }
+        logger.info(
+            "executor waiting for confirmation step=%s instruction=%s",
+            step["id"],
+            instruction,
+        )
+        return updates
+
+    instruction = step.get("prepared_instruction") or build_step_instruction(
+        step, idx, len(plan)
+    )
+    step["status"] = "in_progress"
+    step["confirmed"] = True
+    step.pop("prepared_instruction", None)
+    plan[idx] = step
+
+    updates["plan"] = plan
+    updates["pending_interrupt"] = None
+    updates["status"] = "executing"
+    updates["active_step_id"] = step["id"]
+    updates["last_step_update"] = {
+        "step_id": step["id"],
+        "status": "in_progress",
+    }
+    updates["messages"] = [SystemMessage(content=instruction)]
+    logger.info(
+        "executor moving to in_progress step=%s instruction=%s",
+        step["id"],
+        instruction,
+    )
+    return updates
+
+
+def interrupt_gate(state: AgentState) -> AgentState:
+    pending = state.get("pending_interrupt")
+    if pending:
+        logger.info(
+            "interrupt_gate raising interrupt for step=%s",
+            pending.get("step_id") if isinstance(pending, dict) else pending,
+        )
+        raise NodeInterrupt(pending)
+    return {"pending_interrupt": None}
+
+
+def step_reporter(state: AgentState) -> AgentState:
+    plan = _clone_plan(state.get("plan", []))
+    idx = state.get("current_step", 0)
+
+    if not plan or idx >= len(plan):
+        logger.debug("step_reporter nothing to report idx=%s total=%s", idx, len(plan))
+        return {
+            "plan": plan,
+            "status": "completed" if plan else "idle",
+            "active_step_id": None,
+            "pending_interrupt": None,
+        }
+
+    step = plan[idx]
+    if step.get("status") != "in_progress":
+        logger.debug(
+            "step_reporter skip step=%s status=%s",
+            step.get("id"),
+            step.get("status"),
+        )
+        return {}
+
+    exclude = {step.get("result_message_id")} if step.get("result_message_id") else set()
+    latest_ai = _find_latest_ai_message(state.get("messages", []), exclude)
+    if not latest_ai:
+        logger.debug("step_reporter no new ai message for step=%s", step.get("id"))
+        return {}
+
+    if isinstance(latest_ai.content, str):
+        result_text = latest_ai.content
+    else:
+        result_text = json.dumps(latest_ai.content, ensure_ascii=False)
+
+    step["status"] = "completed"
+    step["result"] = result_text
+    step["result_message_id"] = latest_ai.id
+    plan[idx] = step
+
+    next_idx = idx + 1
+    updates: AgentState = {
+        "plan": plan,
+        "current_step": next_idx,
+        "pending_interrupt": None,
+        "active_step_id": plan[next_idx]["id"] if next_idx < len(plan) else None,
+        "status": "completed" if next_idx >= len(plan) else "executing",
+        "last_step_update": {
+            "step_id": step["id"],
+            "status": "completed",
+            "result": step.get("result", ""),
+        },
+       # "messages":[latest_ai],
+    }
+    logger.info(
+        "step_reporter completed step=%s next_idx=%s result=%s",
+        step["id"],
+        next_idx,
+        step.get("result", ""),
+    )
+    return updates
+
+
+def executor_router(state: AgentState) -> str:
+    if state.get("pending_interrupt"):
+        return "agent"
+    plan = state.get("plan", [])
+    idx = state.get("current_step", 0)
+    status = state.get("status")
+    if not plan or idx >= len(plan) or status in {"completed", "cancelled"}:
+        return "done"
+    return "agent"
 
 
 def _tools_already_executed(messages: List[AnyMessage]) -> List[str]:
@@ -156,6 +510,17 @@ def _tools_already_executed(messages: List[AnyMessage]) -> List[str]:
             if isinstance(name, str):
                 executed.append(name)
     return executed
+
+
+def _infer_required_tools(messages: List[AnyMessage]) -> List[str]:
+    normalized = _extract_user_goal(messages).lower()
+    if not normalized:
+        return []
+    required: List[str] = []
+    for tool_name, hints in TOOL_HINTS.items():
+        if any(hint.lower() in normalized for hint in hints):
+            required.append(tool_name)
+    return required
 
 
 def _infer_default_args(tool_name: str, messages: List[AnyMessage]) -> Optional[Dict[str, Any]]:
@@ -197,7 +562,9 @@ def _extract_tool_calls(messages: List[AnyMessage]) -> List[Dict[str, Any]]:
     return []
 
 
-def _run_tool_without_fallback(tool_name: str, args: Dict[str, Any], spec: ToolExecutionSpec) -> Dict[str, Any]:
+def _run_tool_without_fallback(
+    tool_name: str, args: Dict[str, Any], spec: ToolExecutionSpec
+) -> Dict[str, Any]:
     if tool_name not in TOOL_REGISTRY:
         return {
             "tool": tool_name,
@@ -260,15 +627,25 @@ def _run_tool_without_fallback(tool_name: str, args: Dict[str, Any], spec: ToolE
     }
 
 
-def _execute_tool(tool_name: str, args: Dict[str, Any], spec: ToolExecutionSpec, *, allow_fallback: bool = True) -> Dict[str, Any]:
+def _execute_tool(
+    tool_name: str,
+    args: Dict[str, Any],
+    spec: ToolExecutionSpec,
+    *,
+    allow_fallback: bool = True,
+) -> Dict[str, Any]:
     result = _run_tool_without_fallback(tool_name, args, spec)
     if result["status"] == "ok" or not allow_fallback or not spec.fallback:
         return result
 
     fallback_spec = _get_spec(spec.fallback)
-    fallback_result = _execute_tool(spec.fallback, args, fallback_spec, allow_fallback=False)
+    fallback_result = _execute_tool(
+        spec.fallback, args, fallback_spec, allow_fallback=False
+    )
     result["fallback"] = fallback_result
-    result["latency"] = round(result.get("latency", 0.0) + fallback_result.get("latency", 0.0), 3)
+    result["latency"] = round(
+        result.get("latency", 0.0) + fallback_result.get("latency", 0.0), 3
+    )
 
     if fallback_result.get("status") == "ok":
         primary_error = result.get("error") or "unknown failure"
@@ -283,8 +660,12 @@ def _execute_tool(tool_name: str, args: Dict[str, Any], spec: ToolExecutionSpec,
     return result
 
 
-def _build_tool_message(call: Dict[str, Any], result: Dict[str, Any]) -> ToolMessage:
+def _build_tool_message(
+    call: Dict[str, Any], result: Dict[str, Any], step_id: Optional[str]
+) -> ToolMessage:
     payload = {**result, "tool_call_id": call.get("id")}
+    if step_id:
+        payload["step_id"] = step_id
     return ToolMessage(
         content=json.dumps(payload, ensure_ascii=False),
         tool_call_id=call.get("id"),
@@ -292,10 +673,11 @@ def _build_tool_message(call: Dict[str, Any], result: Dict[str, Any]) -> ToolMes
     )
 
 
-def tool_orchestrator(state: MessagesState) -> Dict[str, List[ToolMessage]]:
-    tool_calls = _extract_tool_calls(state["messages"])
-    required = set(_infer_required_tools(state["messages"]))
-    already_executed = set(_tools_already_executed(state["messages"]))
+def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
+    messages = state.get("messages", [])
+    tool_calls = _extract_tool_calls(messages)
+    required = set(_infer_required_tools(messages))
+    already_executed = set(_tools_already_executed(messages))
     present = {call["name"] for call in tool_calls if call.get("name")}
 
     extra_calls: List[Dict[str, Any]] = []
@@ -303,7 +685,7 @@ def tool_orchestrator(state: MessagesState) -> Dict[str, List[ToolMessage]]:
     for tool_name in sorted(required):
         if tool_name in present or tool_name in already_executed:
             continue
-        default_args = _infer_default_args(tool_name, state["messages"])
+        default_args = _infer_default_args(tool_name, messages)
         if default_args is None:
             continue
         extra_calls.append(
@@ -321,6 +703,7 @@ def tool_orchestrator(state: MessagesState) -> Dict[str, List[ToolMessage]]:
     if not tool_calls:
         return {"messages": []}
 
+    step_id = state.get("active_step_id")
     tasks: List[Dict[str, Any]] = []
     seen_calls = set()
     for call in tool_calls:
@@ -338,9 +721,11 @@ def tool_orchestrator(state: MessagesState) -> Dict[str, List[ToolMessage]]:
     results: Dict[int, ToolMessage] = {}
 
     if parallel_tasks:
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_WORKERS, len(parallel_tasks))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_WORKERS, len(parallel_tasks))
+        ) as executor_pool:
             futures = {
-                executor.submit(
+                executor_pool.submit(
                     _execute_tool,
                     task["call"]["name"],
                     task["args"],
@@ -351,23 +736,27 @@ def tool_orchestrator(state: MessagesState) -> Dict[str, List[ToolMessage]]:
             for future in as_completed(futures):
                 task = futures[future]
                 outcome = future.result()
+                if step_id:
+                    outcome.setdefault("step_id", step_id)
                 idx = task["call"]["index"]
-                results[idx] = _build_tool_message(task["call"], outcome)
+                results[idx] = _build_tool_message(task["call"], outcome, step_id)
 
     for task in sorted(serial_tasks, key=key_fn):
         outcome = _execute_tool(task["call"]["name"], task["args"], task["spec"])
+        if step_id:
+            outcome.setdefault("step_id", step_id)
         idx = task["call"]["index"]
-        results[idx] = _build_tool_message(task["call"], outcome)
+        results[idx] = _build_tool_message(task["call"], outcome, step_id)
 
     ordered = [results[idx] for idx in sorted(results.keys())]
     return {"messages": ordered}
 
 
-# ---- Agent + Graph definition ----
-def agent(state: MessagesState) -> Dict[str, List[AnyMessage]]:
-    messages: List[AnyMessage] = list(state["messages"])
+def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
+    messages: List[AnyMessage] = list(state.get("messages", []))
     if not any(
-        getattr(msg, "type", None) == "system" and getattr(msg, "content", "") == SYSTEM_PROMPT
+        getattr(msg, "type", None) == "system" and getattr(msg, "content", "")
+        == SYSTEM_PROMPT
         for msg in messages
     ):
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
@@ -375,13 +764,29 @@ def agent(state: MessagesState) -> Dict[str, List[AnyMessage]]:
     return {"messages": [response]}
 
 
-graph = StateGraph(MessagesState)
+graph = StateGraph(AgentState)
+graph.add_node("planner", planner)
+graph.add_node("executor", executor)
+graph.add_node("interrupt_gate", interrupt_gate)
 graph.add_node("agent", agent)
 graph.add_node("tools", tool_orchestrator)
+graph.add_node("step_reporter", step_reporter)
 
-graph.add_edge(START, "agent")
-graph.add_conditional_edges("agent", tools_condition, {"tools": "tools", "end": END})
+graph.add_edge(START, "planner")
+graph.add_edge("planner", "executor")
+graph.add_conditional_edges("executor", executor_router, {"agent": "interrupt_gate", "done": END})
+graph.add_edge("interrupt_gate", "agent")
+graph.add_conditional_edges(
+    "agent",
+    tools_condition,
+    {
+        "tools": "tools",
+        "end": "step_reporter",
+        END: "step_reporter",
+    },
+)
 graph.add_edge("tools", "agent")
+graph.add_edge("step_reporter", "executor")
 
 memory = MemorySaver()
 compiled_graph = graph.compile(checkpointer=memory)
