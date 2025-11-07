@@ -19,6 +19,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import tools_condition
 from pydantic import BaseModel, Field
 
+from . import storage
+from .rag import retrieve, store_memory_snippet
 from .tools import calc, faq, kb_search, multi_search, now, unstable
 
 load_dotenv()
@@ -33,6 +35,8 @@ llm = ChatOpenAI(model=MODEL, base_url=BASE_URL, api_key=API_KEY)
 TOOLS = [calc, now, kb_search, multi_search, faq, unstable]
 TOOL_REGISTRY = {tool.name: tool for tool in TOOLS}
 llm_with_tools = llm.bind_tools(TOOLS)
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL") or MODEL
+summary_llm = ChatOpenAI(model=SUMMARY_MODEL, base_url=BASE_URL, api_key=API_KEY)
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
@@ -160,6 +164,12 @@ class PlanStepState(TypedDict, total=False):
 
 
 class AgentState(TypedDict, total=False):
+    user_id: str
+    short_term_summary: str
+    memory_checkpoint: int
+    remember_current: bool
+    retrieval_query: Optional[str]
+    retrieval_results: List[Dict[str, Any]]
     messages: Annotated[List[AnyMessage], add_messages]
     plan: List[PlanStepState]
     current_step: int
@@ -222,6 +232,24 @@ def _extract_user_goal(messages: List[AnyMessage]) -> str:
         fragments.append(str(last_user.content))
     return "\n".join(fragments).strip()
 
+def _stringify_message(message: AnyMessage) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for chunk in content:  # type: ignore[attr-defined]
+            if isinstance(chunk, dict):
+                if "text" in chunk:
+                    parts.append(str(chunk["text"]))
+                elif "content" in chunk:
+                    parts.append(str(chunk["content"]))
+            else:
+                parts.append(str(chunk))
+        return "\n".join(part for part in parts if part).strip()
+    return str(content)
+
+
 
 def _clone_plan(plan: List[PlanStepState]) -> List[PlanStepState]:
     return [dict(step) for step in plan]
@@ -239,6 +267,13 @@ def build_step_instruction(step: PlanStepState, idx: int, total: int) -> str:
     return "\n".join(segments)
 
 
+
+def _find_latest_human_message(messages: List[AnyMessage]) -> Optional[HumanMessage]:
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg
+    return None
+
 def _find_latest_ai_message(
     messages: List[AnyMessage],
     exclude_ids: Optional[Set[str]] = None,
@@ -251,6 +286,106 @@ def _find_latest_ai_message(
             return msg
     return None
 
+
+
+def memory_bootstrap(state: AgentState) -> AgentState:
+    user_id = state.get("user_id")
+    if not user_id:
+        return {}
+
+    updates: AgentState = {}
+    if "short_term_summary" not in state:
+        summary = storage.get_user_summary(user_id)
+        updates["short_term_summary"] = summary
+    if "memory_checkpoint" not in state:
+        updates["memory_checkpoint"] = len(state.get("messages", []))
+    if "retrieval_results" not in state:
+        updates["retrieval_results"] = []
+    if "retrieval_query" not in state:
+        updates["retrieval_query"] = None
+    if "remember_current" not in state:
+        updates["remember_current"] = False
+    return updates
+def prepare_retrieval(state: AgentState) -> AgentState:
+    user_id = state.get("user_id")
+    if not user_id:
+        return {"retrieval_results": []}
+
+    query = _extract_user_goal(state.get("messages", []))
+    previous_query = state.get("retrieval_query")
+    if not query:
+        return {"retrieval_query": None, "retrieval_results": []}
+    if previous_query == query and state.get("retrieval_results"):
+        return {}
+
+    try:
+        results = retrieve(user_id=user_id, query=query, top_k=5)
+    except Exception as exc:  # pragma: no cover - retrieval fallback
+        logger.warning("retrieval failed user=%s err=%s", user_id, exc)
+        results = []
+    return {"retrieval_query": query, "retrieval_results": results}
+
+
+def memory_writer(state: AgentState) -> AgentState:
+    user_id = state.get("user_id")
+    if not user_id:
+        return {}
+
+    messages = state.get("messages", [])
+    checkpoint = int(state.get("memory_checkpoint", 0))
+    recent = messages[checkpoint:]
+    if not recent:
+        return {}
+    has_user = any(isinstance(msg, HumanMessage) for msg in recent)
+    has_ai = any(isinstance(msg, AIMessage) for msg in recent)
+    if not (has_user and has_ai):
+        return {}
+
+    latest_human = _find_latest_human_message(messages)
+    latest_ai = _find_latest_ai_message(messages)
+    if not latest_human or not latest_ai:
+        return {}
+
+    existing_summary = state.get("short_term_summary", "")
+    payload = {
+        "summary": existing_summary,
+        "user_message": _stringify_message(latest_human),
+        "assistant_message": _stringify_message(latest_ai),
+    }
+    try:
+        response = summary_llm.invoke(
+            [
+                SystemMessage(content=SUMMARY_SYSTEM_PROMPT),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+        updated_summary = response.content.strip() if isinstance(response.content, str) else existing_summary
+    except Exception as exc:  # pragma: no cover - summarizer fallback
+        logger.warning("summary generation failed user=%s err=%s", user_id, exc)
+        updated_summary = existing_summary
+
+    try:
+        storage.update_user_summary(user_id, updated_summary)
+    except Exception as exc:  # pragma: no cover - storage fallback
+        logger.warning("summary persistence failed user=%s err=%s", user_id, exc)
+
+    updates: AgentState = {
+        "short_term_summary": updated_summary,
+        "memory_checkpoint": len(messages),
+        "remember_current": False,
+    }
+
+    if state.get("remember_current"):
+        snippet = f"User: {_stringify_message(latest_human)}\nAssistant: {_stringify_message(latest_ai)}"
+        try:
+            store_memory_snippet(
+                user_id=user_id,
+                text=snippet,
+                metadata={"source": "conversation"},
+            )
+        except Exception as exc:  # pragma: no cover - embedding fallback
+            logger.warning("memory snippet store failed user=%s err=%s", user_id, exc)
+    return updates
 
 def planner(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
@@ -753,29 +888,63 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
 
 
 def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
-    messages: List[AnyMessage] = list(state.get("messages", []))
-    if not any(
-        getattr(msg, "type", None) == "system" and getattr(msg, "content", "")
-        == SYSTEM_PROMPT
-        for msg in messages
-    ):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
-    response = llm_with_tools.invoke(messages)
+    raw_messages: List[AnyMessage] = list(state.get("messages", []))
+    filtered: List[AnyMessage] = [
+        msg
+        for msg in raw_messages
+        if not (isinstance(msg, SystemMessage) and msg.content == SYSTEM_PROMPT)
+    ]
+
+    context_messages: List[AnyMessage] = []
+    summary_text = (state.get("short_term_summary") or "").strip()
+    if summary_text:
+        context_messages.append(
+            SystemMessage(
+                content=f"[memory]\n{summary_text}",
+                additional_kwargs={"internal_only": True},
+            )
+        )
+
+    retrievals = state.get("retrieval_results") or []
+    if retrievals:
+        context_lines: List[str] = []
+        for idx, item in enumerate(retrievals, start=1):
+            source = item.get("metadata", {}).get("filename") or item.get("document_id")
+            snippet = item.get("content", "")
+            context_lines.append(f"[{idx}] {source}: {snippet}")
+        context_messages.append(
+            SystemMessage(
+                content="Relevant knowledge base entries:\n" + "\n".join(context_lines),
+                additional_kwargs={
+                    "internal_only": True,
+                    "retrieval_sources": retrievals,
+                },
+            )
+        )
+
+    final_messages: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)] + context_messages + filtered
+    response = llm_with_tools.invoke(final_messages)
     return {"messages": [response]}
 
 
+
 graph = StateGraph(AgentState)
+graph.add_node("memory_bootstrap", memory_bootstrap)
 graph.add_node("planner", planner)
 graph.add_node("executor", executor)
 graph.add_node("interrupt_gate", interrupt_gate)
+graph.add_node("retrieval", prepare_retrieval)
 graph.add_node("agent", agent)
 graph.add_node("tools", tool_orchestrator)
 graph.add_node("step_reporter", step_reporter)
+graph.add_node("memory_writer", memory_writer)
 
-graph.add_edge(START, "planner")
+graph.add_edge(START, "memory_bootstrap")
+graph.add_edge("memory_bootstrap", "planner")
 graph.add_edge("planner", "executor")
 graph.add_conditional_edges("executor", executor_router, {"agent": "interrupt_gate", "done": END})
-graph.add_edge("interrupt_gate", "agent")
+graph.add_edge("interrupt_gate", "retrieval")
+graph.add_edge("retrieval", "agent")
 graph.add_conditional_edges(
     "agent",
     tools_condition,
@@ -786,7 +955,8 @@ graph.add_conditional_edges(
     },
 )
 graph.add_edge("tools", "agent")
-graph.add_edge("step_reporter", "executor")
+graph.add_edge("step_reporter", "memory_writer")
+graph.add_edge("memory_writer", "executor")
 
 memory = MemorySaver()
 compiled_graph = graph.compile(checkpointer=memory)

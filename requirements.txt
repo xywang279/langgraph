@@ -1,4 +1,5 @@
 fastapi==0.115.5
+python-multipart==0.0.9
 uvicorn[standard]==0.32.0
 python-dotenv==1.0.1
 
@@ -6,3 +7,4 @@ python-dotenv==1.0.1
 langchain==0.3.7
 langgraph==0.2.39
 langchain-openai==0.2.5
+sentence-transformers==2.2.2
