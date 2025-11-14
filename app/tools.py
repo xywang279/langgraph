@@ -1,3 +1,4 @@
+# app/tools.py
 from __future__ import annotations
 
 import ast
@@ -5,7 +6,7 @@ import operator as op
 import random
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -19,16 +20,14 @@ _OPS = {
     ast.USub: op.neg,
 }
 
-
 class CalcArgs(BaseModel):
     expression: str = Field(
         ...,
         description="Arithmetic expression using + - * / and parentheses, e.g. '1 + 2*(3-1)'.",
     )
 
-
 def _eval_ast(node: ast.AST) -> float:
-    # 兼容 Python 3.8+ 的 ast.Constant 以及旧版 ast.Num
+    # 兼容 Python 3.8+ 的 ast.Constant 与旧版 ast.Num
     if isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return node.value
@@ -39,11 +38,10 @@ def _eval_ast(node: ast.AST) -> float:
         return _OPS[type(node.op)](_eval_ast(node.operand))  # type: ignore[arg-type]
     if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
         return _OPS[type(node.op)](
-            _eval_ast(node.left),  # type: ignore[arg-type]
+            _eval_ast(node.left),   # type: ignore[arg-type]
             _eval_ast(node.right),  # type: ignore[arg-type]
         )
     raise ValueError("Only + - * / and parentheses are supported.")
-
 
 @tool("calc", args_schema=CalcArgs)
 def calc(expression: str) -> str:
@@ -51,33 +49,30 @@ def calc(expression: str) -> str:
     try:
         node = ast.parse(expression, mode="eval").body
         return str(_eval_ast(node))
-    except Exception as exc:  # pragma: no cover - 示例无需覆盖
+    except Exception as exc:  # 小型示例无需细分
         return f"ERROR: {exc}"
 
-
+# ---- 当前时间（结构化参数，可自定义格式） ----
 class NowArgs(BaseModel):
     fmt: str = Field(
         "%Y-%m-%d %H:%M",
         description="Python strftime format string, defaults to '%Y-%m-%d %H:%M'.",
     )
 
-
 @tool("now", args_schema=NowArgs)
 def now(fmt: str = "%Y-%m-%d %H:%M") -> str:
     """返回当前时间，支持 strftime 格式化。"""
     return datetime.now().strftime(fmt)
 
-
+# ---- 极简本地知识库 ----
 _KB: Dict[str, str] = {
     "langgraph": "LangGraph：用于构建有状态 Agent 的图式执行框架，支持循环、持久化与可观测。",
     "tool arbitration": "多工具场景可按优先级、超时和降级策略调度，保障整体吞吐与稳定性。",
     "wechat drafting": "公众号写作常见流程：选题→调研→数据校验→排版→发布。",
 }
 
-
 class KnowledgeArgs(BaseModel):
     query: str = Field(..., description="Keyword for local knowledge-base lookup.")
-
 
 def _kb_lookup(query: str) -> str:
     q = query.lower()
@@ -89,47 +84,18 @@ def _kb_lookup(query: str) -> str:
         return "未命中本地知识库。"
     return "\n".join(hits)
 
-
 @tool("kb_search", args_schema=KnowledgeArgs)
 def kb_search(query: str) -> str:
     """本地知识库检索，适合兜底或快速查找内置资料。"""
     return _kb_lookup(query)
 
-
-_FAQ: Dict[str, str] = {
-    "LangGraph 是什么": "LangGraph 是一个针对有状态 Agent 的编排框架，支持图式执行、循环控制与持久化存储。",
-    "工具降级如何提示": "在工具失败后，observation 字段会写明失败原因以及是否触发 fallback。",
-    "并行工具会不会阻塞": "tool_orchestrator 会依据 priority 和 exclusive 配置决定是否并发执行，默认可并发的工具不会互相阻塞。",
-}
-
-
-class FaqArgs(BaseModel):
-    question: str = Field(..., description="Question to lookup in local FAQ store.")
-
-
-def _faq_lookup(question: str) -> str:
-    q = question.strip().lower()
-    if not q:
-        return "请输入有效的问题。"
-    for key, value in _FAQ.items():
-        if q in key.lower():
-            return f"{key}：{value}"
-    return "未命中本地 FAQ，可改用 multi_search 获取更多信息。"
-
-
-@tool("faq", args_schema=FaqArgs)
-def faq(question: str) -> str:
-    """本地 FAQ 检索，适合快速回答常见问题。"""
-    return _faq_lookup(question)
-
-
+# ---- 多源检索（模拟外部数据 + 本地 KB 合并；可能抛异常，交给上层降级） ----
 class MultiSearchArgs(BaseModel):
     query: str = Field(..., description="Topic to research for the article.")
     prefer_fresh: bool = Field(
         False,
         description="Set true to prefer simulated online sources even if local KB has an answer.",
     )
-
 
 def _simulate_online_sources(query: str, prefer_fresh: bool) -> List[str]:
     """模拟外部检索：可能成功，也可能因限流或超时抛出异常。"""
@@ -146,13 +112,13 @@ def _simulate_online_sources(query: str, prefer_fresh: bool) -> List[str]:
         raise RuntimeError("random upstream failure for fresh sources")
     return [f"未找到 {query} 的权威公开结果，可退回内置资料。"]
 
-
 @tool("multi_search", args_schema=MultiSearchArgs)
 def multi_search(query: str, prefer_fresh: bool = False) -> str:
     """多源检索：尝试模拟在线数据，必要时将结果并入本地知识库。"""
     try:
         online_hits = _simulate_online_sources(query, prefer_fresh)
-    except Exception as exc:  # 交给编排层做降级
+    except Exception as exc:
+        # 故意把异常抛给上层（你的 orchestrator 会做超时/重试/降级）
         raise RuntimeError(f"上游检索失败：{exc}") from exc
 
     kb_hits = _kb_lookup(query)
@@ -160,27 +126,46 @@ def multi_search(query: str, prefer_fresh: bool = False) -> str:
     combined = "\n".join(online_hits + ([kb_section] if kb_section else []))
     return combined.strip() or "检索完成，但未找到可用信息。"
 
+# ---- FAQ（你的计划模板/TOOL_SPECS 里用到了它，这里补齐） ----
+class FAQArgs(BaseModel):
+    topic: str = Field("writing", description="FAQ topic, e.g. writing/wechat.")
 
+@tool("faq", args_schema=FAQArgs)
+def faq(topic: str = "writing") -> str:
+    """返回一个简短 FAQ 段落（示例）。"""
+    if topic.lower() in {"writing", "wechat"}:
+        return "FAQ: 标题要聚焦痛点；每段 3-5 句；用数据/案例增强可信度。"
+    return f"FAQ: 暂无 '{topic}' 主题。"
+
+# ---- 不稳定工具（演示超时/重试/降级） ----
 class UnstableArgs(BaseModel):
-    task: str = Field(..., description="Task name used to identify the run.")
-    seconds: float = Field(
-        3.0,
-        ge=0,
-        description="Simulated execution time in seconds.",
-    )
-    fail: bool = Field(
-        False,
-        description="If true, raise an exception to simulate a failure.",
-    )
-
+    task: str = Field(..., description="A label for this dummy task.")
+    seconds: float = Field(3.0, description="Simulated latency in seconds.")
+    fail: bool = Field(False, description="If true, raise an exception.")
 
 @tool("unstable", args_schema=UnstableArgs)
 def unstable(task: str, seconds: float = 3.0, fail: bool = False) -> str:
     """
-    一个“可能很慢 / 会失败”的工具：sleep seconds 后返回。
-    设置 fail=True 模拟异常。用于验证超时 / 重试 / 降级路径。
+    一个“可能很慢/会失败”的工具：sleep seconds 后返回。
+    设置 fail=True 模拟异常。用于验证超时/重试/降级路径。
     """
     time.sleep(max(0.0, float(seconds)))
     if fail:
         raise RuntimeError(f"Task '{task}' failed intentionally.")
     return f"Task '{task}' done after {seconds}s."
+
+# ====== 对外导出：给 graph.py 使用 ======
+
+def get_registered_tools():
+    """供 llm.bind_tools([...]) 使用（需要一个 Tool 列表）。"""
+    return [calc, now, kb_search, multi_search, faq, unstable]
+
+# 供自研编排器按名字调用 .invoke(args)
+TOOL_REGISTRY: Dict[str, Any] = {
+    "calc": calc,
+    "now": now,
+    "kb_search": kb_search,
+    "multi_search": multi_search,
+    "faq": faq,
+    "unstable": unstable,
+}

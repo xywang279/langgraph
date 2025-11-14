@@ -11,20 +11,48 @@ from typing import Any, Annotated, Dict, List, Literal, Optional, Set, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.errors import NodeInterrupt
+from langgraph.types import interrupt, Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import tools_condition
 from pydantic import BaseModel, Field
+
+# ---- tools_condition: 多版本兼容导入（新 → 旧 → 本地兜底）----
+try:
+    # 常见新版本：langgraph>=0.3
+    from langgraph.prebuilt import tools_condition  # type: ignore
+except Exception:
+    try:
+        # 老版本：langgraph 0.1~0.2
+        from langgraph.prebuilt.tool_node import tools_condition  # type: ignore
+    except Exception:
+        # 兜底实现：根据最后一条 AIMessage 是否包含 tool_calls 来路由
+        def tools_condition(
+            state: Dict[str, Any],
+            *,
+            messages_key: str = "messages",
+        ) -> Literal["tools", "__end__"]:
+            msgs: List[Any] = state.get(messages_key, [])
+            if not msgs:
+                return "__end__"
+            last = msgs[-1]
+            # LangChain 的 AIMessage 一般有 .tool_calls
+            tc = getattr(last, "tool_calls", None)
+            if isinstance(tc, list) and tc:
+                return "tools"
+            # 部分提供商把 tool_calls 放在 additional_kwargs
+            ak = getattr(last, "additional_kwargs", {}) or {}
+            if isinstance(ak.get("tool_calls"), list) and ak["tool_calls"]:
+                return "tools"
+            return "__end__"
 
 from . import storage
 from .rag import retrieve, store_memory_snippet
-from .tools import calc, faq, kb_search, multi_search, now, unstable
+from .tools import TOOL_REGISTRY, get_registered_tools
 
 load_dotenv()
-
 
 # ---- LLM & tools registration ----
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -32,8 +60,7 @@ BASE_URL = os.getenv("OPENAI_BASE_URL")
 API_KEY = os.getenv("OPENAI_API_KEY")
 
 llm = ChatOpenAI(model=MODEL, base_url=BASE_URL, api_key=API_KEY)
-TOOLS = [calc, now, kb_search, multi_search, faq, unstable]
-TOOL_REGISTRY = {tool.name: tool for tool in TOOLS}
+TOOLS = get_registered_tools()
 llm_with_tools = llm.bind_tools(TOOLS)
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL") or MODEL
 summary_llm = ChatOpenAI(model=SUMMARY_MODEL, base_url=BASE_URL, api_key=API_KEY)
@@ -52,6 +79,27 @@ PLANNER_PROMPT = (
     "明确每一步需要产出的结果与可能使用的工具。"
     "如果某一步需要用户确认才能继续，请将 requires_confirmation 置为 true。"
     "返回 JSON 结构，供后续执行器使用。"
+)
+
+# 如果项目里未定义 SUMMARY_SYSTEM_PROMPT，这里给一个兜底，避免 NameError
+try:
+    SUMMARY_SYSTEM_PROMPT
+except NameError:
+    SUMMARY_SYSTEM_PROMPT = "你是会话摘要器，请基于给定的 summary 与最近一轮对话生成简洁的短期对话摘要。"
+
+agent_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "{system_prompt}"),
+        MessagesPlaceholder("context_messages"),
+        MessagesPlaceholder("conversation"),
+    ]
+)
+
+planner_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", PLANNER_PROMPT),
+        ("human", "{goal}"),
+    ]
 )
 
 
@@ -179,32 +227,27 @@ class AgentState(TypedDict, total=False):
     last_step_update: Optional[Dict[str, Any]]
 
 
-planner_llm = llm.with_structured_output(PlanOutline)
+planner_chain = planner_prompt | llm.with_structured_output(PlanOutline)
+agent_chain = agent_prompt | llm_with_tools
 
 FALLBACK_PLAN_BLUEPRINT: List[Dict[str, Any]] = [
     {
-        "title": "确认文章标题与角度",
-        "description": "根据用户需求列出 1-2 个备选标题，请用户确认后再继续。",
-        "requires_confirmation": True,
-        "tool_names": ["faq"],
-    },
-    {
-        "title": "资料调研与要点整理",
-        "description": "利用 multi_search 或 kb_search 收集 LangGraph 最新进展与核心卖点，沉淀出 3-4 条写作提纲。",
-        "tool_names": ["multi_search", "kb_search"],
-    },
-    {
-        "title": "撰写正文草稿",
-        "description": "围绕确认后的标题与提纲，生成公众号风格正文（含小标题、数据或案例引用）。",
+        "title": "澄清并理解用户问题",
+        "description": "快速复述用户需求，确认需要解答的信息类型；必要时准备调用相关工具。",
+        "requires_confirmation": False,
         "tool_names": [],
     },
     {
-        "title": "校对与发布建议",
-        "description": "检查稿件逻辑、润色语言，并给出排版与配图提示。",
+        "title": "检索或调用工具获取答案",
+        "description": "根据需求选择 now、calc、kb_search 或 multi_search 等工具，提取关键事实。",
+        "tool_names": ["now", "calc", "kb_search", "multi_search"],
+    },
+    {
+        "title": "整理输出最终回复",
+        "description": "把工具结果组织成清晰的回答，并在需要时注明来源或下一步建议。",
         "tool_names": [],
     },
 ]
-
 
 
 def _extract_user_goal(messages: List[AnyMessage]) -> str:
@@ -232,6 +275,7 @@ def _extract_user_goal(messages: List[AnyMessage]) -> str:
         fragments.append(str(last_user.content))
     return "\n".join(fragments).strip()
 
+
 def _stringify_message(message: AnyMessage) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
@@ -250,7 +294,6 @@ def _stringify_message(message: AnyMessage) -> str:
     return str(content)
 
 
-
 def _clone_plan(plan: List[PlanStepState]) -> List[PlanStepState]:
     return [dict(step) for step in plan]
 
@@ -267,12 +310,12 @@ def build_step_instruction(step: PlanStepState, idx: int, total: int) -> str:
     return "\n".join(segments)
 
 
-
 def _find_latest_human_message(messages: List[AnyMessage]) -> Optional[HumanMessage]:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             return msg
     return None
+
 
 def _find_latest_ai_message(
     messages: List[AnyMessage],
@@ -285,7 +328,6 @@ def _find_latest_ai_message(
                 continue
             return msg
     return None
-
 
 
 def memory_bootstrap(state: AgentState) -> AgentState:
@@ -306,6 +348,8 @@ def memory_bootstrap(state: AgentState) -> AgentState:
     if "remember_current" not in state:
         updates["remember_current"] = False
     return updates
+
+
 def prepare_retrieval(state: AgentState) -> AgentState:
     user_id = state.get("user_id")
     if not user_id:
@@ -320,7 +364,7 @@ def prepare_retrieval(state: AgentState) -> AgentState:
 
     try:
         results = retrieve(user_id=user_id, query=query, top_k=5)
-    except Exception as exc:  # pragma: no cover - retrieval fallback
+    except Exception as exc:  # pragma: no cover
         logger.warning("retrieval failed user=%s err=%s", user_id, exc)
         results = []
     return {"retrieval_query": query, "retrieval_results": results}
@@ -360,13 +404,13 @@ def memory_writer(state: AgentState) -> AgentState:
             ]
         )
         updated_summary = response.content.strip() if isinstance(response.content, str) else existing_summary
-    except Exception as exc:  # pragma: no cover - summarizer fallback
+    except Exception as exc:  # pragma: no cover
         logger.warning("summary generation failed user=%s err=%s", user_id, exc)
         updated_summary = existing_summary
 
     try:
         storage.update_user_summary(user_id, updated_summary)
-    except Exception as exc:  # pragma: no cover - storage fallback
+    except Exception as exc:  # pragma: no cover
         logger.warning("summary persistence failed user=%s err=%s", user_id, exc)
 
     updates: AgentState = {
@@ -383,9 +427,10 @@ def memory_writer(state: AgentState) -> AgentState:
                 text=snippet,
                 metadata={"source": "conversation"},
             )
-        except Exception as exc:  # pragma: no cover - embedding fallback
+        except Exception as exc:  # pragma: no cover
             logger.warning("memory snippet store failed user=%s err=%s", user_id, exc)
     return updates
+
 
 def planner(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
@@ -396,13 +441,8 @@ def planner(state: AgentState) -> AgentState:
     outline: Optional[PlanOutline]
     planner_note: Optional[str] = None
     try:
-        outline = planner_llm.invoke(
-            [
-                SystemMessage(content=PLANNER_PROMPT),
-                HumanMessage(content=goal),
-            ]
-        )
-    except Exception as exc:  # pragma: no cover - fallback only
+        outline = planner_chain.invoke({"goal": goal})
+    except Exception as exc:  # pragma: no cover
         logger.warning("Planner structured output failed: %s", exc)
         planner_note = "Planner output could not be parsed; switched to a default four-step template."
         objective = goal or "default objective"
@@ -452,6 +492,7 @@ def planner(state: AgentState) -> AgentState:
         "last_step_update": None,
         "messages": messages_out,
     }
+
 
 def executor(state: AgentState) -> AgentState:
     plan = _clone_plan(state.get("plan", []))
@@ -551,10 +592,11 @@ def interrupt_gate(state: AgentState) -> AgentState:
     pending = state.get("pending_interrupt")
     if pending:
         logger.info(
-            "interrupt_gate raising interrupt for step=%s",
+            "interrupt_gate triggering interrupt for step=%s",
             pending.get("step_id") if isinstance(pending, dict) else pending,
         )
-        raise NodeInterrupt(pending)
+        # 新写法：暂停执行，外部用 Command(resume=...) 恢复
+        interrupt(pending)
     return {"pending_interrupt": None}
 
 
@@ -608,7 +650,6 @@ def step_reporter(state: AgentState) -> AgentState:
             "status": "completed",
             "result": step.get("result", ""),
         },
-       # "messages":[latest_ai],
     }
     logger.info(
         "step_reporter completed step=%s next_idx=%s result=%s",
@@ -737,7 +778,7 @@ def _run_tool_without_fallback(
             latency = time.perf_counter() - started
             total_latency += latency
             last_error = f"timeout after {spec.timeout}s"
-        except Exception as exc:  # pragma: no cover - demo only
+        except Exception as exc:  # pragma: no cover
             latency = time.perf_counter() - started
             total_latency += latency
             last_error = repr(exc)
@@ -922,10 +963,13 @@ def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
             )
         )
 
-    final_messages: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)] + context_messages + filtered
-    response = llm_with_tools.invoke(final_messages)
+    payload = {
+        "system_prompt": SYSTEM_PROMPT,
+        "context_messages": context_messages,
+        "conversation": filtered,
+    }
+    response = agent_chain.invoke(payload)
     return {"messages": [response]}
-
 
 
 graph = StateGraph(AgentState)
@@ -945,15 +989,17 @@ graph.add_edge("planner", "executor")
 graph.add_conditional_edges("executor", executor_router, {"agent": "interrupt_gate", "done": END})
 graph.add_edge("interrupt_gate", "retrieval")
 graph.add_edge("retrieval", "agent")
+
+# 关键：tools_condition 的结束分支键是 "__end__"
 graph.add_conditional_edges(
     "agent",
     tools_condition,
     {
         "tools": "tools",
-        "end": "step_reporter",
-        END: "step_reporter",
+        "__end__": "step_reporter",
     },
 )
+
 graph.add_edge("tools", "agent")
 graph.add_edge("step_reporter", "memory_writer")
 graph.add_edge("memory_writer", "executor")

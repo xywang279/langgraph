@@ -1,14 +1,20 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import math
 import os
+import shutil
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sentence_transformers import SentenceTransformer
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 
 from . import storage
 
@@ -19,47 +25,176 @@ EMBED_MODEL = os.getenv(
     "EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 
-_EMBEDDINGS: Optional[SentenceTransformer] = None
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_VECTOR_DIR = _ROOT_DIR / "data" / "vectorstores"
+_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
+
+_TEXT_SPLITTER: Optional[RecursiveCharacterTextSplitter] = None
+_EMBEDDINGS: Optional[HuggingFaceEmbeddings] = None
 
 
-def _get_embeddings() -> SentenceTransformer:
+class UserVectorStoreRetriever(BaseRetriever):
+    """LangChain 1.0 compatible retriever bound to a user's FAISS index."""
+
+    user_id: str
+    top_k: int = 5
+    min_score: float = 0.2
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: Optional[CallbackManagerForRetrieverRun] = None,
+    ) -> List[Document]:
+        normalized = (query or "").strip()
+        if not normalized:
+            return []
+
+        _ensure_user(self.user_id)
+        store = _ensure_vector_store(self.user_id)
+        if store is None:
+            return _legacy_similarity_scan(
+                user_id=self.user_id,
+                query=normalized,
+                top_k=self.top_k,
+                min_score=self.min_score,
+            )
+
+        documents: List[Document] = []
+        for doc, distance in store.similarity_search_with_score(
+            normalized, k=self.top_k
+        ):
+            similarity = max(0.0, 1.0 - float(distance))
+            if similarity < self.min_score:
+                continue
+            metadata = dict(doc.metadata or {})
+            metadata["score"] = similarity
+            documents.append(
+                Document(
+                    page_content=_format_snippet(doc.page_content),
+                    metadata=metadata,
+                )
+            )
+        return documents
+
+
+def _get_text_splitter() -> RecursiveCharacterTextSplitter:
+    global _TEXT_SPLITTER
+    if _TEXT_SPLITTER is None:
+        _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+        )
+    return _TEXT_SPLITTER
+
+
+def _get_embedding_model() -> HuggingFaceEmbeddings:
     global _EMBEDDINGS
     if _EMBEDDINGS is None:
         logger.info("loading embedding model %s", EMBED_MODEL)
-        _EMBEDDINGS = SentenceTransformer(EMBED_MODEL)
+        _EMBEDDINGS = HuggingFaceEmbeddings(
+            model_name=EMBED_MODEL,
+            encode_kwargs={"normalize_embeddings": True},
+        )
     return _EMBEDDINGS
 
 
-def _split_text(
-    text: str, *, chunk_size: int = 800, chunk_overlap: int = 200
-) -> List[Tuple[int, int, str]]:
-    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
-    length = len(cleaned)
-    if not cleaned.strip():
-        return []
-
-    window = max(chunk_size, 200)
-    stride = max(window - chunk_overlap, 100)
-
-    segments: List[Tuple[int, int, str]] = []
-    start = 0
-    index = 0
-    while start < length:
-        stop = min(length, start + window)
-        chunk = cleaned[start:stop]
-        if chunk.strip():
-            segments.append((start, stop, chunk.strip()))
-        start += stride
-        index += 1
-    return segments
-
-
-def embed_texts(texts: Sequence[str]) -> List[List[float]]:
+def _embed_texts(texts: Sequence[str]) -> List[List[float]]:
     if not texts:
         return []
-    model = _get_embeddings()
-    vectors = model.encode(list(texts), normalize_embeddings=True)
-    return [vector.tolist() for vector in vectors]
+    model = _get_embedding_model()
+    return model.embed_documents(list(texts))
+
+
+def _sanitize_user_id(user_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (user_id or ""))
+    return safe or "_default"
+
+
+def _vector_store_dir(user_id: str) -> Path:
+    safe = _sanitize_user_id(user_id)
+    target = _VECTOR_DIR / safe
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _load_vector_store(user_id: str) -> Optional[FAISS]:
+    base = _vector_store_dir(user_id)
+    index_path = base / "index.faiss"
+    store_path = base / "index.pkl"
+    if not index_path.exists() or not store_path.exists():
+        return None
+    try:
+        return FAISS.load_local(
+            str(base),
+            embeddings=_get_embedding_model(),
+            allow_dangerous_deserialization=True,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("failed to load vector index for user=%s err=%s", user_id, exc)
+        return None
+
+
+def _persist_vector_store(user_id: str, store: FAISS) -> None:
+    target = _vector_store_dir(user_id)
+    store.save_local(str(target))
+
+
+def _delete_vector_store(user_id: str) -> None:
+    base = _vector_store_dir(user_id)
+    if base.exists():
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+
+
+def _append_to_vector_index(user_id: str, documents: List[Document]) -> None:
+    if not documents:
+        return
+    store = _load_vector_store(user_id)
+    embeddings = _get_embedding_model()
+    if store is None:
+        store = FAISS.from_documents(documents, embeddings)
+    else:
+        store.add_documents(documents)
+    _persist_vector_store(user_id, store)
+
+
+def _rebuild_vector_index(user_id: str) -> None:
+    chunks = list(storage.iter_user_chunks(user_id))
+    if not chunks:
+        _delete_vector_store(user_id)
+        return
+    documents = _documents_from_chunks(chunks)
+    embeddings = _get_embedding_model()
+    store = FAISS.from_documents(documents, embeddings)
+    _persist_vector_store(user_id, store)
+
+
+def _ensure_vector_store(user_id: str) -> Optional[FAISS]:
+    store = _load_vector_store(user_id)
+    if store is not None:
+        return store
+    _rebuild_vector_index(user_id)
+    return _load_vector_store(user_id)
+
+
+def _documents_from_chunks(chunks: Iterable[Dict[str, Any]]) -> List[Document]:
+    documents: List[Document] = []
+    for chunk in chunks:
+        metadata = dict(chunk.get("metadata") or {})
+        metadata.setdefault("chunk_id", chunk["id"])
+        metadata.setdefault("document_id", chunk["document_id"])
+        metadata.setdefault("chunk_index", chunk["chunk_index"])
+        documents.append(Document(page_content=chunk["content"], metadata=metadata))
+    return documents
+
+
+def _format_snippet(text: str, *, max_length: int = 300) -> str:
+    snippet = " ".join(text.split())
+    if len(snippet) <= max_length:
+        return snippet
+    return snippet[: max_length - 1].rstrip() + "..."
 
 
 def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -69,11 +204,28 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _format_snippet(text: str, *, max_length: int = 300) -> str:
-    snippet = " ".join(text.split())
-    if len(snippet) <= max_length:
-        return snippet
-    return snippet[: max_length - 1].rstrip() + "..."
+def _legacy_similarity_scan(
+    *, user_id: str, query: str, top_k: int, min_score: float
+) -> List[Document]:
+    embeddings = _embed_texts([query])
+    if not embeddings:
+        return []
+    query_vector = embeddings[0]
+
+    scored: List[Tuple[float, Document]] = []
+    for chunk in storage.iter_user_chunks(user_id):
+        score = _cosine_similarity(query_vector, chunk["embedding"])
+        if score < min_score:
+            continue
+        metadata = dict(chunk.get("metadata") or {})
+        metadata.setdefault("document_id", chunk["document_id"])
+        metadata.setdefault("chunk_id", chunk["id"])
+        metadata["score"] = score
+        doc = Document(page_content=_format_snippet(chunk["content"]), metadata=metadata)
+        scored.append((score, doc))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [doc for _, doc in scored[:top_k]]
 
 
 def _ensure_user(user_id: str) -> None:
@@ -89,43 +241,52 @@ def process_document_file(
     file_path: Path,
 ) -> None:
     _ensure_user(user_id)
-    logger.info("processing document doc_id=%s user=%s path=%s", document_id, user_id, file_path)
+    logger.info(
+        "processing document doc_id=%s user=%s path=%s", document_id, user_id, file_path
+    )
 
     try:
         text = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         text = file_path.read_text(encoding="utf-8", errors="ignore")
 
-    segments = _split_text(text)
-    if not segments:
+    splitter = _get_text_splitter()
+    chunks = [chunk.strip() for chunk in splitter.split_text(text) if chunk.strip()]
+    if not chunks:
         storage.update_document_status(
             document_id, status="empty", error="Document contains no readable content."
         )
         logger.warning("document empty doc_id=%s user=%s", document_id, user_id)
         return
 
+    embeddings = _embed_texts(chunks)
     chunk_payloads: List[Dict[str, Any]] = []
-    embeddings = embed_texts([segment for _, _, segment in segments])
-    for (start, stop, chunk_text), embedding in zip(segments, embeddings):
+    documents: List[Document] = []
+    for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+        chunk_id = uuid.uuid4().hex
+        metadata = {
+            "filename": file_path.name,
+            "chunk_index": idx,
+            "document_id": document_id,
+            "chunk_id": chunk_id,
+        }
         chunk_payloads.append(
             {
-                "id": uuid.uuid4().hex,
-                "chunk_index": len(chunk_payloads),
+                "id": chunk_id,
+                "chunk_index": idx,
                 "content": chunk_text,
                 "embedding": embedding,
-                "metadata": {
-                    "start": start,
-                    "end": stop,
-                    "filename": file_path.name,
-                },
+                "metadata": metadata,
             }
         )
+        documents.append(Document(page_content=chunk_text, metadata=metadata))
 
     storage.delete_chunks_for_document(document_id)
     storage.store_chunks(document_id=document_id, user_id=user_id, chunks=chunk_payloads)
     storage.update_document_status(document_id, status="ready")
+    _rebuild_vector_index(user_id)
     logger.info(
-        "document processed doc_id=%s user=%s chunks=%s", document_id, user_id, len(chunk_payloads)
+        "document processed doc_id=%s user=%s chunks=%s", document_id, user_id, len(documents)
     )
 
 
@@ -139,23 +300,28 @@ def store_memory_snippet(
     if not cleaned:
         return None
     _ensure_user(user_id)
-    embeddings = embed_texts([cleaned])
+    embeddings = _embed_texts([cleaned])
     if not embeddings:
         return None
     document_id = storage.ensure_memory_document(user_id)
     chunk_id = uuid.uuid4().hex
+    chunk_metadata = {"source": "memory", **(metadata or {})}
+    chunk_metadata.update({"document_id": document_id, "chunk_id": chunk_id})
+    payload = {
+        "id": chunk_id,
+        "chunk_index": int(time.time()),
+        "content": cleaned,
+        "embedding": embeddings[0],
+        "metadata": chunk_metadata,
+    }
     storage.store_chunks(
         document_id=document_id,
         user_id=user_id,
-        chunks=[
-            {
-                "id": chunk_id,
-                "chunk_index": int(time.time()),
-                "content": cleaned,
-                "embedding": embeddings[0],
-                "metadata": metadata or {"source": "memory"},
-            }
-        ],
+        chunks=[payload],
+    )
+    _append_to_vector_index(
+        user_id,
+        [Document(page_content=cleaned, metadata=chunk_metadata)],
     )
     return chunk_id
 
@@ -167,35 +333,20 @@ def retrieve(
     top_k: int = 5,
     min_score: float = 0.2,
 ) -> List[Dict[str, Any]]:
-    normalized_query = (query or "").strip()
-    if not normalized_query:
-        return []
+    retriever = UserVectorStoreRetriever(user_id=user_id, top_k=top_k, min_score=min_score)
+    documents = retriever.invoke(query)
 
-    _ensure_user(user_id)
-    embeddings = embed_texts([normalized_query])
-    if not embeddings:
-        return []
-    query_vector = embeddings[0]
-
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for chunk in storage.iter_user_chunks(user_id):
-        score = _cosine_similarity(query_vector, chunk["embedding"])
-        if score < min_score:
-            continue
-        snippet = _format_snippet(chunk["content"])
-        metadata = dict(chunk.get("metadata") or {})
-        scored.append(
-            (
-                score,
-                {
-                    "chunk_id": chunk["id"],
-                    "document_id": chunk["document_id"],
-                    "content": snippet,
-                    "score": round(score, 4),
-                    "metadata": metadata,
-                },
-            )
+    results: List[Dict[str, Any]] = []
+    for doc in documents:
+        metadata = dict(doc.metadata or {})
+        results.append(
+            {
+                "chunk_id": metadata.get("chunk_id"),
+                "document_id": metadata.get("document_id"),
+                "content": doc.page_content,
+                "score": round(float(metadata.get("score", 0.0)), 4),
+                "metadata": metadata,
+            }
         )
+    return results
 
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [payload for _, payload in scored[:top_k]]

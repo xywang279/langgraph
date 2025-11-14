@@ -1,4 +1,5 @@
 ﻿from __future__ import annotations
+import os
 
 import json
 import logging
@@ -50,6 +51,15 @@ logger.setLevel(logging.INFO)
 
 DOCS_ROOT = Path(__file__).resolve().parent.parent / "docs"
 DOCS_ROOT.mkdir(parents=True, exist_ok=True)
+DEFAULT_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "40"))
+
+
+def _build_graph_config(thread_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    configurable: Dict[str, Any] = {"thread_id": thread_id}
+    if user_id:
+        configurable["user_id"] = user_id
+    return {"configurable": configurable, "recursion_limit": DEFAULT_RECURSION_LIMIT}
+
 
 app = FastAPI(title="LangGraph Agent · Tool Orchestration Demo")
 
@@ -247,7 +257,7 @@ def chat(body: ChatReq) -> ChatResp:
 
     result = compiled_graph.invoke(
         initial_state,
-        config={"configurable": {"thread_id": body.session_id, "user_id": user_id}},
+        config=_build_graph_config(body.session_id, user_id),
     )
     logger.info(
         "chat response session=%s messages=%s",
@@ -287,7 +297,7 @@ def chat_stream(
     )
 
     def event_gen():
-        cfg = {"configurable": {"thread_id": session_id, "user_id": resolved_user}}
+        cfg = _build_graph_config(session_id, resolved_user)
         initial_state: Dict[str, Any] = {
             "messages": [HumanMessage(content=message)],
             "user_id": resolved_user,
@@ -334,7 +344,7 @@ def chat_continue(thread_id: str, action: str, user_id: Optional[str] = None):
     if verb not in {"continue", "cancel"}:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
-    base_cfg = {"configurable": {"thread_id": thread_id}}
+    base_cfg = _build_graph_config(thread_id)
     try:
         snapshot = compiled_graph.get_state(base_cfg)
     except ValueError as exc:  # no checkpoint available
@@ -350,7 +360,7 @@ def chat_continue(thread_id: str, action: str, user_id: Optional[str] = None):
         resolved_user,
         action,
     )
-    base_cfg = {"configurable": {"thread_id": thread_id, "user_id": resolved_user}}
+    base_cfg = _build_graph_config(thread_id, resolved_user)
     plan: List[Dict[str, Any]] = state_values.get("plan", [])  # type: ignore[assignment]
     if not plan:
         raise HTTPException(status_code=400, detail="No plan to resume")
