@@ -15,6 +15,7 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    Response,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -23,8 +24,15 @@ from langgraph.types import Interrupt
 from pydantic import BaseModel
 from starlette import status
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
 from . import storage
-from .graph import build_step_instruction, compiled_graph
+from .graph import (
+    build_step_instruction,
+    compiled_graph,
+    get_tool_budget_settings,
+    update_tool_budget_settings,
+)
 from .rag import process_document_file, retrieve
 
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
@@ -81,6 +89,18 @@ class ChatReq(BaseModel):
 
 class ChatResp(BaseModel):
     reply: str
+
+
+class ToolBudgetConfig(BaseModel):
+    max_tasks: int
+    max_parallel: int
+    total_latency: float
+
+
+class ToolBudgetUpdate(BaseModel):
+    max_tasks: Optional[int] = None
+    max_parallel: Optional[int] = None
+    total_latency: Optional[float] = None
 
 
 pending_interrupts: Dict[str, Dict[str, Any]] = {}
@@ -538,3 +558,25 @@ def get_document(document_id: str, user_id: str):
     if not doc or doc.get("user_id") != normalized_user:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+
+@app.get("/config/tool-budget", response_model=ToolBudgetConfig)
+def read_tool_budget():
+    settings = get_tool_budget_settings()
+    return ToolBudgetConfig(**settings.as_dict())
+
+
+@app.patch("/config/tool-budget", response_model=ToolBudgetConfig)
+def patch_tool_budget(payload: ToolBudgetUpdate):
+    updates = payload.dict(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No changes submitted.")
+    new_settings = update_tool_budget_settings(**updates)
+    logger.info("tool budget patched fields=%s", sorted(updates.keys()))
+    return ToolBudgetConfig(**new_settings.as_dict())
+
+
+@app.get("/metrics")
+def metrics():
+    payload = generate_latest()
+    return Response(content=payload, media_type=CONTENT_TYPE_LATEST)

@@ -5,9 +5,12 @@ import logging
 import os
 import time
 import uuid
+import atexit
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
-from dataclasses import dataclass
-from typing import Any, Annotated, Dict, List, Literal, Optional, Set, TypedDict
+import threading
+from dataclasses import dataclass, replace
+from typing import Any, Annotated, Dict, List, Literal, Optional, Set, Tuple, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -18,6 +21,7 @@ from langgraph.types import interrupt, Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+from prometheus_client import Counter
 
 # ---- tools_condition: 多版本兼容导入（新 → 旧 → 本地兜底）----
 try:
@@ -154,7 +158,101 @@ TOOL_SPECS: Dict[str, ToolExecutionSpec] = {
     ),
 }
 
-MAX_PARALLEL_WORKERS = 4
+MAX_PARALLEL_WORKERS = int(os.getenv("TOOL_MAX_WORKERS", "4"))
+
+
+@dataclass(frozen=True)
+class ToolExecutionBudget:
+    max_tasks: int = 6
+    max_parallel: int = 3
+    total_latency: float = 12.0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "max_tasks": self.max_tasks,
+            "max_parallel": self.max_parallel,
+            "total_latency": self.total_latency,
+        }
+
+
+def _clamp_positive(value: int, *, floor: int = 1, ceil: Optional[int] = None) -> int:
+    cap = ceil if ceil is not None else value
+    return max(floor, min(cap, value))
+
+
+class ToolBudgetManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._settings = ToolExecutionBudget(
+            max_tasks=_clamp_positive(int(os.getenv("TOOL_MAX_TASKS", "6")), floor=1),
+            max_parallel=_clamp_positive(
+                int(os.getenv("TOOL_MAX_PARALLEL", "3")), floor=1, ceil=MAX_PARALLEL_WORKERS
+            ),
+            total_latency=float(os.getenv("TOOL_MAX_LATENCY", "12")),
+        )
+
+    def get(self) -> ToolExecutionBudget:
+        with self._lock:
+            return replace(self._settings)
+
+    def update(
+        self,
+        *,
+        max_tasks: Optional[int] = None,
+        max_parallel: Optional[int] = None,
+        total_latency: Optional[float] = None,
+    ) -> ToolExecutionBudget:
+        with self._lock:
+            settings = self._settings
+            if max_tasks is not None:
+                settings = replace(settings, max_tasks=_clamp_positive(max_tasks, floor=1))
+            if max_parallel is not None:
+                settings = replace(
+                    settings,
+                    max_parallel=_clamp_positive(
+                        max_parallel, floor=1, ceil=MAX_PARALLEL_WORKERS
+                    ),
+                )
+            if total_latency is not None:
+                safe_latency = max(0.0, float(total_latency))
+                settings = replace(settings, total_latency=safe_latency)
+            self._settings = settings
+            logger.info(
+                "tool budget updated max_tasks=%s max_parallel=%s total_latency=%s",
+                settings.max_tasks,
+                settings.max_parallel,
+                settings.total_latency,
+            )
+            return replace(self._settings)
+
+
+TOOL_THROTTLE_COUNTER = Counter(
+    "tool_throttle_events_total",
+    "Number of tool calls skipped due to guardrails",
+    ("reason",),
+)
+TOOL_LATENCY_SECONDS = Counter(
+    "tool_latency_seconds_total",
+    "Total time spent executing tools (wall-clock seconds)",
+)
+TOOL_LATENCY_BUDGET_EXHAUSTED = Counter(
+    "tool_latency_budget_exhausted_total",
+    "Times the orchestration latency budget was exhausted mid-run",
+)
+
+tool_budget_manager = ToolBudgetManager()
+
+
+def get_tool_budget_settings() -> ToolExecutionBudget:
+    return tool_budget_manager.get()
+
+
+def update_tool_budget_settings(**kwargs: Any) -> ToolExecutionBudget:
+    return tool_budget_manager.update(**kwargs)
+
+
+_SHARED_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS)
+atexit.register(_SHARED_TOOL_EXECUTOR.shutdown)
 
 
 def _get_spec(tool_name: str) -> ToolExecutionSpec:
@@ -849,6 +947,45 @@ def _build_tool_message(
     )
 
 
+def _skip_task_message(
+    task: Dict[str, Any],
+    reason: str,
+    step_id: Optional[str],
+    *,
+    code: str,
+) -> ToolMessage:
+    call = task["call"]
+    spec: ToolExecutionSpec = task["spec"]
+    result = {
+        "tool": call.get("name") or "unknown",
+        "status": "skipped",
+        "observation": reason,
+        "latency": 0.0,
+        "tries": 0,
+        "priority": spec.priority,
+        "exclusive": spec.exclusive,
+        "error": code,
+    }
+    return _build_tool_message(call, result, step_id)
+
+
+def _run_parallel_batch(batch: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    futures = {
+        _SHARED_TOOL_EXECUTOR.submit(
+            _execute_tool,
+            task["call"]["name"],
+            task["args"],
+            task["spec"],
+        ): task
+        for task in batch
+    }
+    completed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for future in as_completed(futures):
+        task = futures[future]
+        completed.append((task, future.result()))
+    return completed
+
+
 def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
     messages = state.get("messages", [])
     tool_calls = _extract_tool_calls(messages)
@@ -890,39 +1027,120 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
         seen_calls.add(key)
         tasks.append({"call": call, "spec": spec, "args": call["args"]})
 
-    parallel_tasks = [task for task in tasks if not task["spec"].exclusive]
-    serial_tasks = [task for task in tasks if task["spec"].exclusive]
+    if not tasks:
+        return {"messages": []}
+
+    budget = tool_budget_manager.get()
+    latency_budget = budget.total_latency if budget.total_latency > 0 else float("inf")
+
     key_fn = lambda item: (item["spec"].priority, item["call"]["index"])
+    ordered_tasks = sorted(tasks, key=key_fn)
+    max_tasks = budget.max_tasks or len(ordered_tasks)
+    selected_tasks = ordered_tasks[:max_tasks]
+    trimmed_tasks = ordered_tasks[max_tasks:]
 
     results: Dict[int, ToolMessage] = {}
+    for task in trimmed_tasks:
+        idx = task["call"]["index"]
+        results[idx] = _skip_task_message(
+            task,
+            f"Skipped because tool budget only allows {budget.max_tasks} calls per turn.",
+            step_id,
+            code="max_calls",
+        )
+    if trimmed_tasks:
+        TOOL_THROTTLE_COUNTER.labels(reason="max_calls").inc(len(trimmed_tasks))
+        logger.warning(
+            "tool orchestrator trimmed %s tasks due to max_tasks budget=%s user=%s step=%s",
+            len(trimmed_tasks),
+            budget.max_tasks,
+            state.get("user_id"),
+            step_id,
+            extra={
+                "event": "tool_throttle",
+                "reason": "max_calls",
+                "trimmed": len(trimmed_tasks),
+                "budget": budget.max_tasks,
+            },
+        )
 
-    if parallel_tasks:
-        with ThreadPoolExecutor(
-            max_workers=min(MAX_PARALLEL_WORKERS, len(parallel_tasks))
-        ) as executor_pool:
-            futures = {
-                executor_pool.submit(
-                    _execute_tool,
-                    task["call"]["name"],
-                    task["args"],
-                    task["spec"],
-                ): task
-                for task in sorted(parallel_tasks, key=key_fn)
-            }
-            for future in as_completed(futures):
-                task = futures[future]
-                outcome = future.result()
-                if step_id:
-                    outcome.setdefault("step_id", step_id)
-                idx = task["call"]["index"]
-                results[idx] = _build_tool_message(task["call"], outcome, step_id)
+    if not selected_tasks:
+        ordered = [results[idx] for idx in sorted(results.keys())]
+        return {"messages": ordered}
 
-    for task in sorted(serial_tasks, key=key_fn):
+    parallel_queue = deque(task for task in selected_tasks if not task["spec"].exclusive)
+    serial_queue = deque(task for task in selected_tasks if task["spec"].exclusive)
+
+    latency_consumed = 0.0
+    budget_limit = latency_budget
+    budget_stop = False
+    budget_reason: Optional[str] = None
+
+    def _record_latency(outcome: Dict[str, Any]) -> None:
+        nonlocal latency_consumed, budget_stop, budget_reason
+        try:
+            latency_value = float(outcome.get("latency", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            latency_value = 0.0
+        latency_value = max(0.0, latency_value)
+        latency_consumed += latency_value
+        if latency_value:
+            TOOL_LATENCY_SECONDS.inc(latency_value)
+        if budget_limit < float("inf") and not budget_stop and latency_consumed >= budget_limit:
+            budget_stop = True
+            budget_reason = (
+                f"Tool latency budget ({budget.total_latency}s) was exhausted."
+            )
+
+    parallel_batch_size = budget.max_parallel or 1
+    if parallel_batch_size > MAX_PARALLEL_WORKERS:
+        parallel_batch_size = MAX_PARALLEL_WORKERS
+
+    while parallel_queue and not budget_stop:
+        batch: List[Dict[str, Any]] = []
+        while parallel_queue and len(batch) < parallel_batch_size:
+            batch.append(parallel_queue.popleft())
+        for task, outcome in _run_parallel_batch(batch):
+            if step_id:
+                outcome.setdefault("step_id", step_id)
+            idx = task["call"]["index"]
+            results[idx] = _build_tool_message(task["call"], outcome, step_id)
+            _record_latency(outcome)
+
+    while serial_queue and not budget_stop:
+        task = serial_queue.popleft()
         outcome = _execute_tool(task["call"]["name"], task["args"], task["spec"])
         if step_id:
             outcome.setdefault("step_id", step_id)
         idx = task["call"]["index"]
         results[idx] = _build_tool_message(task["call"], outcome, step_id)
+        _record_latency(outcome)
+
+    if budget_stop:
+        pending = list(parallel_queue) + list(serial_queue)
+        reason = budget_reason or "Resource budget exhausted before remaining tools could run."
+        for task in pending:
+            idx = task["call"]["index"]
+            if idx in results:
+                continue
+            results[idx] = _skip_task_message(task, reason, step_id, code="latency_budget")
+        TOOL_THROTTLE_COUNTER.labels(reason="latency_budget").inc(len(pending))
+        TOOL_LATENCY_BUDGET_EXHAUSTED.inc()
+        logger.warning(
+            "tool orchestrator latency budget hit user=%s step=%s consumed=%.3f limit=%.3f pending=%s",
+            state.get("user_id"),
+            step_id,
+            latency_consumed,
+            budget.total_latency,
+            len(pending),
+            extra={
+                "event": "tool_throttle",
+                "reason": "latency_budget",
+                "pending": len(pending),
+                "consumed": latency_consumed,
+                "limit": budget.total_latency,
+            },
+        )
 
     ordered = [results[idx] for idx in sorted(results.keys())]
     return {"messages": ordered}

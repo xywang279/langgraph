@@ -24,6 +24,9 @@ import {
   Progress,
   Empty,
   Tabs,
+  InputNumber,
+  Form,
+  Alert,
 } from 'antd'
 import {
   SendOutlined,
@@ -34,9 +37,10 @@ import {
   UserOutlined,
   DatabaseOutlined,
   InboxOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 
-import { API_BASE } from '../api'
+import { API_BASE, fetchToolBudgetConfig, updateToolBudgetConfig } from '../api'
 
 const { Text, Paragraph } = Typography
 const { Dragger } = Upload
@@ -48,20 +52,30 @@ const INITIAL_PLAN = { steps: [], currentStep: 0, activeStepId: null }
 const ROLE_CONFIG = {
   user: {
     tag: { color: 'processing', label: 'USER' },
-    bubble: { background: '#1d4ed8', color: '#e0f2fe', alignSelf: 'flex-end' },
+    bubble: { background: '#e0f2ff', color: '#0f172a', alignSelf: 'flex-end', border: '1px solid #bfdbfe' },
   },
   ai: {
     tag: { color: 'success', label: 'ASSISTANT' },
-    bubble: { background: '#065f46', color: '#d1fae5', alignSelf: 'flex-start' },
+    bubble: { background: '#dcfce7', color: '#065f46', alignSelf: 'flex-start', border: '1px solid #bbf7d0' },
   },
   tool: {
     tag: { color: 'geekblue', label: 'TOOL' },
-    bubble: { background: '#111827', color: '#facc15', alignSelf: 'stretch' },
+    bubble: { background: '#fff9db', color: '#854d0e', alignSelf: 'stretch', border: '1px solid #fde68a' },
   },
   system: {
     tag: { color: 'purple', label: 'SYSTEM' },
-    bubble: { background: '#312e81', color: '#ede9fe', alignSelf: 'flex-start' },
+    bubble: { background: '#ede9fe', color: '#3730a3', alignSelf: 'flex-start', border: '1px solid #ddd6fe' },
   },
+}
+
+const THEME = {
+  cardBg: '#ffffff',
+  cardBorder: '#e2e8f0',
+  panelBg: '#f8fafc',
+  accentBg: '#dbeafe',
+  inputBg: '#ffffff',
+  inputText: '#0f172a',
+  mutedText: '#475569',
 }
 
 const STEP_STATUS_TEXT = {
@@ -120,6 +134,14 @@ export default function Chat() {
   const [rememberNext, setRememberNext] = useState(false)
   const [documents, setDocuments] = useState([])
   const [documentsLoading, setDocumentsLoading] = useState(false)
+  const [toolBudget, setToolBudget] = useState(null)
+  const [toolBudgetDraft, setToolBudgetDraft] = useState({
+    max_tasks: 6,
+    max_parallel: 3,
+    total_latency: 12,
+  })
+  const [toolBudgetLoading, setToolBudgetLoading] = useState(false)
+  const [toolBudgetSaving, setToolBudgetSaving] = useState(false)
 
   const esRef = useRef(null)
   const liveMessageRef = useRef(null)
@@ -510,6 +532,24 @@ export default function Chat() {
     [sessionId, userId, initializeStream, buildStreamUrl]
   )
 
+  const refreshToolBudget = useCallback(async () => {
+    setToolBudgetLoading(true)
+    try {
+      const data = await fetchToolBudgetConfig()
+      setToolBudget(data)
+      setToolBudgetDraft(data)
+    } catch (err) {
+      console.warn('failed to load tool budget', err)
+      antdMessage.error('Failed to load tool budget settings')
+    } finally {
+      setToolBudgetLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    refreshToolBudget()
+  }, [refreshToolBudget])
+
   const refreshDocuments = useCallback(async () => {
     if (!userId) return
     setDocumentsLoading(true)
@@ -533,6 +573,63 @@ export default function Chat() {
     const timer = setInterval(refreshDocuments, 5000)
     return () => clearInterval(timer)
   }, [refreshDocuments])
+
+  const handleBudgetFieldChange = useCallback((field, value) => {
+    setToolBudgetDraft((prev) => ({
+      ...prev,
+      [field]: typeof value === 'number' ? value : prev[field],
+    }))
+  }, [])
+
+  const budgetChanged = useMemo(() => {
+    if (!toolBudget) return false
+    return (
+      toolBudget.max_tasks !== toolBudgetDraft.max_tasks ||
+      toolBudget.max_parallel !== toolBudgetDraft.max_parallel ||
+      toolBudget.total_latency !== toolBudgetDraft.total_latency
+    )
+  }, [toolBudget, toolBudgetDraft])
+
+  const handleBudgetSave = useCallback(async () => {
+    if (!toolBudget) return
+    const payload = {}
+    if (toolBudgetDraft.max_tasks !== toolBudget.max_tasks) {
+      payload.max_tasks = toolBudgetDraft.max_tasks
+    }
+    if (toolBudgetDraft.max_parallel !== toolBudget.max_parallel) {
+      payload.max_parallel = toolBudgetDraft.max_parallel
+    }
+    if (toolBudgetDraft.total_latency !== toolBudget.total_latency) {
+      payload.total_latency = toolBudgetDraft.total_latency
+    }
+    if (Object.keys(payload).length === 0) {
+      antdMessage.info('No budget changes to apply')
+      return
+    }
+    setToolBudgetSaving(true)
+    try {
+      const next = await updateToolBudgetConfig(payload)
+      setToolBudget(next)
+      setToolBudgetDraft(next)
+      antdMessage.success('Tool budget updated')
+    } catch (err) {
+      console.error('failed to update tool budget', err)
+      antdMessage.error(err.message || 'Failed to update tool budget')
+    } finally {
+      setToolBudgetSaving(false)
+    }
+  }, [toolBudget, toolBudgetDraft])
+
+  const handleBudgetReset = useCallback(() => {
+    if (toolBudget) {
+      setToolBudgetDraft(toolBudget)
+    }
+  }, [toolBudget])
+
+  const openMetricsFeed = useCallback(() => {
+    const url = `${API_BASE}/metrics`
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }, [])
 
   const uploadProps = useMemo(
     () => ({
@@ -573,8 +670,8 @@ export default function Chat() {
           marginTop: 12,
           padding: 12,
           borderRadius: 10,
-          background: '#0f172a',
-          border: '1px solid #1f2937',
+          background: THEME.panelBg,
+          border: `1px solid ${THEME.cardBorder}`,
         }}
       >
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -592,17 +689,17 @@ export default function Chat() {
               <div
                 key={`${source.chunk_id || source.document_id || index}`}
                 style={{
-                  background: '#0b1220',
+                  background: THEME.cardBg,
                   borderRadius: 8,
                   padding: 10,
-                  border: '1px solid #1f2937',
+                  border: `1px solid ${THEME.cardBorder}`,
                 }}
               >
                 <Space size={8} align="center">
                   <Tag color="cyan">{name}</Tag>
                   <Tag color="geekblue">{score || 'retrieved'}</Tag>
                 </Space>
-                <Paragraph style={{ marginBottom: 0, color: '#cbd5f5' }}>
+                <Paragraph style={{ marginBottom: 0, color: THEME.mutedText }}>
                   {source.content || '(empty snippet)'}
                 </Paragraph>
               </div>
@@ -642,7 +739,7 @@ export default function Chat() {
             background: roleStyle.bubble.background,
             color: roleStyle.bubble.color,
             borderRadius: 10,
-            border: '1px solid #1f2937',
+            border: roleStyle.bubble.border || `1px solid ${THEME.cardBorder}`,
             padding: 12,
             minWidth: 120,
             maxWidth: '100%',
@@ -676,13 +773,20 @@ export default function Chat() {
     )
 
     return (
-      <div style={{ background: '#111827', padding: 12, borderRadius: 12 }}>
+      <div
+        style={{
+          background: THEME.accentBg,
+          padding: 12,
+          borderRadius: 12,
+          border: `1px solid ${THEME.cardBorder}`,
+        }}
+      >
         <Space direction="vertical" style={{ width: '100%' }} size={8}>
           <Space
             align="center"
             style={{ width: '100%', justifyContent: 'space-between' }}
           >
-            <Text style={{ color: '#f9fafb' }}>
+            <Text style={{ color: THEME.inputText }}>
               Workflow progress ({percent}%)
             </Text>
             <Tag color="blue">{status.toUpperCase()}</Tag>
@@ -708,7 +812,12 @@ export default function Chat() {
 
   return (
     <Card
-      style={{ background: '#0b1220', borderRadius: 16, border: '1px solid #1f2937' }}
+      style={{
+        background: THEME.cardBg,
+        borderRadius: 16,
+        border: `1px solid ${THEME.cardBorder}`,
+        boxShadow: '0 8px 24px rgba(15, 23, 42, 0.08)',
+      }}
       styles={{ body: { padding: 16 } }}
     >
       <Space direction="vertical" size="large" style={{ width: '100%' }}>
@@ -722,7 +831,12 @@ export default function Chat() {
             value={userId}
             onChange={(e) => setUserId(e.target.value)}
             placeholder="User ID"
-            style={{ width: 240, background: '#0f172a', color: '#e5e7eb' }}
+            style={{
+              width: 240,
+              background: THEME.inputBg,
+              color: THEME.inputText,
+              border: `1px solid ${THEME.cardBorder}`,
+            }}
           />
           <Tooltip title="Refresh documents">
             <Button
@@ -778,7 +892,11 @@ export default function Chat() {
                           startStream()
                         }
                       }}
-                      style={{ background: '#0f172a', color: '#e5e7eb' }}
+                      style={{
+                        background: THEME.inputBg,
+                        color: THEME.inputText,
+                        borderColor: THEME.cardBorder,
+                      }}
                     />
                     <Tooltip title="Send">
                       <Button
@@ -815,7 +933,10 @@ export default function Chat() {
                       <span>Knowledge Upload</span>
                     </Space>
                   }
-                  style={{ background: '#0f172a', border: '1px solid #1f2937' }}
+                  style={{
+                    background: THEME.cardBg,
+                    border: `1px solid ${THEME.cardBorder}`,
+                  }}
                 >
                   <Space direction="vertical" size="large" style={{ width: '100%' }}>
                     <Dragger {...uploadProps} disabled={!userId}>
@@ -833,7 +954,7 @@ export default function Chat() {
                     <Divider style={{ margin: '12px 0' }} />
 
                     <Space direction="vertical" style={{ width: '100%' }}>
-                      <Text style={{ color: '#e5e7eb' }}>Uploaded documents</Text>
+                      <Text style={{ color: THEME.inputText }}>Uploaded documents</Text>
                       {documents.length === 0 ? (
                         <Empty
                           image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -846,10 +967,10 @@ export default function Chat() {
                           renderItem={(item) => (
                             <List.Item
                               style={{
-                                background: '#0b1220',
+                                background: THEME.panelBg,
                                 borderRadius: 8,
                                 marginBottom: 8,
-                                border: '1px solid #1f2937',
+                                border: `1px solid ${THEME.cardBorder}`,
                               }}
                             >
                               <Space
@@ -887,6 +1008,93 @@ export default function Chat() {
                         />
                       )}
                     </Space>
+                  </Space>
+                </Card>
+              ),
+            },
+            {
+              key: 'ops',
+              label: 'Ops Console',
+              children: (
+                <Card
+                  size="small"
+                  style={{
+                    background: THEME.cardBg,
+                    border: `1px solid ${THEME.cardBorder}`,
+                  }}
+                  title="Tool Budget Controls"
+                >
+                  <Space direction="vertical" size="large" style={{ width: '100%' }}>
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="Guardrail budget"
+                      description="Tune max tool calls, concurrency, and latency budget without redeploying. Metrics are exported for Grafana/Prometheus via /metrics."
+                    />
+                    <Form
+                      layout="vertical"
+                      requiredMark={false}
+                      style={{
+                        background: THEME.panelBg,
+                        padding: 16,
+                        borderRadius: 12,
+                        border: `1px solid ${THEME.cardBorder}`,
+                      }}
+                    >
+                      <Form.Item label="Max tool calls per request">
+                        <InputNumber
+                          min={1}
+                          max={32}
+                          value={toolBudgetDraft.max_tasks}
+                          onChange={(value) => handleBudgetFieldChange('max_tasks', value)}
+                          disabled={toolBudgetLoading}
+                        />
+                      </Form.Item>
+                      <Form.Item label="Max parallel (non-exclusive) tools">
+                        <InputNumber
+                          min={1}
+                          max={10}
+                          value={toolBudgetDraft.max_parallel}
+                          onChange={(value) => handleBudgetFieldChange('max_parallel', value)}
+                          disabled={toolBudgetLoading}
+                        />
+                      </Form.Item>
+                      <Form.Item label="Total latency budget (seconds)">
+                        <InputNumber
+                          min={1}
+                          max={120}
+                          step={0.5}
+                          value={toolBudgetDraft.total_latency}
+                          onChange={(value) => handleBudgetFieldChange('total_latency', value)}
+                          disabled={toolBudgetLoading}
+                        />
+                      </Form.Item>
+                    </Form>
+                    <Space wrap>
+                      <Button
+                        type="primary"
+                        icon={<SaveOutlined />}
+                        onClick={handleBudgetSave}
+                        disabled={!budgetChanged || toolBudgetLoading}
+                        loading={toolBudgetSaving}
+                      >
+                        Apply changes
+                      </Button>
+                      <Button onClick={handleBudgetReset} disabled={!toolBudget || toolBudgetLoading}>
+                        Reset form
+                      </Button>
+                      <Button icon={<ReloadOutlined />} onClick={refreshToolBudget} loading={toolBudgetLoading}>
+                        Refresh from server
+                      </Button>
+                      <Button icon={<LineChartOutlined />} onClick={openMetricsFeed}>
+                        Open metrics feed
+                      </Button>
+                    </Space>
+                    <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                      Metrics endpoint:{' '}
+                      <code style={{ color: '#f472b6' }}>{`${API_BASE}/metrics`}</code>. Grafana can scrape this
+                      Prometheus feed to alert when <code>tool_throttle_events_total</code> spikes.
+                    </Paragraph>
                   </Space>
                 </Card>
               ),
