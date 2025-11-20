@@ -2,6 +2,7 @@ fastapi==0.115.5
 python-multipart==0.0.9
 uvicorn[standard]==0.32.0
 python-dotenv==1.0.1
+requests==2.32.3
 
 
 # LangChain/LangGraph stack

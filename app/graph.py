@@ -10,7 +10,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Annotated, Dict, List, Literal, Optional, Set, Tuple, TypedDict
+from typing import Any, Annotated, Callable, Dict, List, Literal, Optional, Set, Tuple, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter
 
 # ---- tools_condition: 多版本兼容导入（新 → 旧 → 本地兜底）----
@@ -57,6 +57,8 @@ from .rag import retrieve, store_memory_snippet
 from .tools import TOOL_REGISTRY, get_registered_tools
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+logger.info("HTTP_SEARCH_BASE_URL=%s", os.getenv("HTTP_SEARCH_BASE_URL"))
 
 # ---- LLM & tools registration ----
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -70,6 +72,9 @@ SUMMARY_MODEL = os.getenv("SUMMARY_MODEL") or MODEL
 summary_llm = ChatOpenAI(model=SUMMARY_MODEL, base_url=BASE_URL, api_key=API_KEY)
 logger = logging.getLogger(__name__)
 
+ENABLE_DOCUMENT_RETRIEVAL = os.getenv("ENABLE_DOCUMENT_RETRIEVAL", "true").strip().lower()
+ENABLE_DOCUMENT_RETRIEVAL = ENABLE_DOCUMENT_RETRIEVAL not in {"0", "false", "no"}
+
 SYSTEM_PROMPT = (
     "你是一名公众号写作助手。"
     "当用户在指令中点名某个工具（例如“用 now”“调用 calc”）时，"
@@ -82,7 +87,10 @@ PLANNER_PROMPT = (
     "请将用户的任务拆解为 3-5 个可执行步骤，"
     "明确每一步需要产出的结果与可能使用的工具。"
     "如果某一步需要用户确认才能继续，请将 requires_confirmation 置为 true。"
-    "返回 JSON 结构，供后续执行器使用。"
+    "可调用的工具 ID 包括：now（获取当前时间）、calc（算式计算）、http_search（在线检索）、"
+    "doc_insights（文档向量检索）、internal_api（内部系统接口）和 workflow_trigger（触发工作流）。"
+    "当某个步骤需要某个工具时，请在 tool_names 字段中填入准确的工具 ID（例如 \"now\"），避免使用概念化的名字。"
+    "最终严格输出 JSON 结构，供后续执行器使用。"
 )
 
 # 如果项目里未定义 SUMMARY_SYSTEM_PROMPT，这里给一个兜底，避免 NameError
@@ -106,6 +114,8 @@ planner_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+planner_llm = llm.bind(response_format={"type": "json_object"})
+
 
 @dataclass(frozen=True)
 class ToolExecutionSpec:
@@ -119,42 +129,41 @@ class ToolExecutionSpec:
 
 
 TOOL_SPECS: Dict[str, ToolExecutionSpec] = {
-    "multi_search": ToolExecutionSpec(
-        name="multi_search",
+    "http_search": ToolExecutionSpec(
+        name="http_search",
         priority=1,
-        timeout=8.0,
+        timeout=10.0,
         retries=1,
         backoff=0.8,
-        fallback="kb_search",
+        fallback="doc_insights",
     ),
-    "kb_search": ToolExecutionSpec(
-        name="kb_search",
+    "doc_insights": ToolExecutionSpec(
+        name="doc_insights",
         priority=2,
-        timeout=3.0,
+        timeout=8.0,
+    ),
+    "internal_api": ToolExecutionSpec(
+        name="internal_api",
+        priority=2,
+        timeout=8.0,
+        retries=1,
+        backoff=0.6,
+    ),
+    "workflow_trigger": ToolExecutionSpec(
+        name="workflow_trigger",
+        priority=3,
+        timeout=6.0,
+        exclusive=True,
     ),
     "calc": ToolExecutionSpec(
         name="calc",
-        priority=3,
+        priority=4,
         timeout=2.0,
     ),
     "now": ToolExecutionSpec(
         name="now",
-        priority=3,
-        timeout=1.0,
-        exclusive=True,
-    ),
-    "faq": ToolExecutionSpec(
-        name="faq",
-        priority=4,
+        priority=5,
         timeout=2.0,
-    ),
-    "unstable": ToolExecutionSpec(
-        name="unstable",
-        priority=2,
-        timeout=4.0,
-        retries=1,
-        backoff=1.0,
-        exclusive=True,
     ),
 }
 
@@ -262,10 +271,35 @@ def _get_spec(tool_name: str) -> ToolExecutionSpec:
 TOOL_HINTS = {
     "now": ["now", "当前时间", "现在几点", "现在时间", "time"],
     "calc": ["calc", "计算", "算一下", "结果是多少", "算出", "求值"],
-    "kb_search": ["kb", "知识库", "资料", "查一下资料"],
-    "multi_search": ["multi_search", "多源", "检索", "搜索", "调研"],
-    "faq": ["faq", "常见问题", "帮助", "说明", "文档"],
-    "unstable": ["unstable", "慢工具", "不稳定", "超时测试", "重试"],
+    "http_search": [
+        "http_search",
+        "搜索",
+        "在线检索",
+        "新闻",
+        "最新信息",
+        "查一下",
+        "查找",
+        "search",
+        "lookup",
+        "latest update",
+        "最新更新",
+        "use the tools",
+    ],
+    "doc_insights": ["文档", "资料", "上传内容", "insight", "记忆", "kb"],
+    "internal_api": ["内部接口", "ticket", "订单", "inventory", "internal_api"],
+    "workflow_trigger": ["工作流", "触发流程", "自动化", "发布", "workflow"],
+}
+
+
+def _context_with_user(state: "AgentState") -> Dict[str, Any]:
+    user_id = state.get("user_id")
+    return {"user_id": user_id} if user_id else {}
+
+
+TOOL_CONTEXT_PROVIDERS: Dict[str, Callable[["AgentState"], Dict[str, Any]]] = {
+    "doc_insights": _context_with_user,
+    "internal_api": _context_with_user,
+    "workflow_trigger": _context_with_user,
 }
 
 
@@ -277,13 +311,122 @@ class PlanStepModel(BaseModel):
     )
     tool_names: List[str] = Field(
         default_factory=list,
-        description="建议使用的内置工具名称列表，例如 calc、now、kb_search",
+        description="建议使用的内置工具名称列表，例如 calc、now、http_search",
     )
 
 
 class PlanOutline(BaseModel):
     objective: str = Field(..., description="整体目标概述")
     steps: List[PlanStepModel] = Field(..., min_length=1, max_length=6)
+
+
+def _stringify_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for chunk in content:
+            if isinstance(chunk, dict):
+                if "text" in chunk:
+                    parts.append(str(chunk["text"]))
+                elif "content" in chunk:
+                    parts.append(str(chunk["content"]))
+            else:
+                parts.append(str(chunk))
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _normalize_plan_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload)
+    objective = normalized.get("objective") or normalized.get("goal") or normalized.get("summary")
+    if not isinstance(objective, str) or not objective.strip():
+        normalized["objective"] = "Auto generated execution plan"
+    else:
+        normalized["objective"] = objective.strip()
+
+    raw_steps = normalized.get("steps") or []
+    if not isinstance(raw_steps, list):
+        normalized["steps"] = []
+        return normalized
+
+    cleaned_steps: List[Dict[str, Any]] = []
+    for idx, raw_step in enumerate(raw_steps, start=1):
+        if not isinstance(raw_step, dict):
+            continue
+        step = dict(raw_step)
+        title = (
+            step.get("title")
+            or step.get("name")
+            or step.get("summary")
+            or step.get("description")
+        )
+        if not isinstance(title, str) or not title.strip():
+            step_number = step.get("step_number")
+            if isinstance(step_number, int):
+                title = f"Step {step_number}"
+            else:
+                title = f"Step {idx}"
+        step["title"] = str(title).strip()
+
+        description = (
+            step.get("description")
+            or step.get("description_text")
+            or step.get("details")
+            or step.get("summary")
+        )
+        if not isinstance(description, str) or not description.strip():
+            description = step["title"]
+        step["description"] = str(description).strip()
+
+        requires_confirmation = step.get("requires_confirmation")
+        if requires_confirmation is None:
+            requires_confirmation = bool(
+                step.get("needs_confirmation")
+                or step.get("requires_user_input")
+                or step.get("await_user")
+            )
+        step["requires_confirmation"] = bool(requires_confirmation)
+
+        tool_names = step.get("tool_names")
+        if isinstance(tool_names, list):
+            step["tool_names"] = [str(tool).strip() for tool in tool_names if tool]
+        elif isinstance(tool_names, str):
+            step["tool_names"] = [tool_names.strip()]
+        elif isinstance(step.get("tools"), list):
+            step["tool_names"] = [str(tool).strip() for tool in step["tools"] if tool]
+        else:
+            step["tool_names"] = []
+
+        cleaned_steps.append(step)
+
+    normalized["steps"] = cleaned_steps
+    return normalized
+
+
+def _parse_plan_outline(raw: Any) -> PlanOutline:
+    if isinstance(raw, PlanOutline):
+        return raw
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        content = getattr(raw, "content", raw)
+        text = _stringify_content(content)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Planner response is not valid JSON: {exc}") from exc
+    if isinstance(payload, list):
+        payload = {"steps": payload}
+    if not isinstance(payload, dict):
+        raise ValueError("Planner response is not a JSON object.")
+    normalized = _normalize_plan_payload(payload)
+    try:
+        return PlanOutline.model_validate(normalized)
+    except ValidationError as exc:
+        raise ValueError(f"Planner response missing required fields: {exc}") from exc
 
 
 StepStatus = Literal[
@@ -325,7 +468,7 @@ class AgentState(TypedDict, total=False):
     last_step_update: Optional[Dict[str, Any]]
 
 
-planner_chain = planner_prompt | llm.with_structured_output(PlanOutline)
+planner_chain = planner_prompt | planner_llm
 agent_chain = agent_prompt | llm_with_tools
 
 FALLBACK_PLAN_BLUEPRINT: List[Dict[str, Any]] = [
@@ -337,8 +480,8 @@ FALLBACK_PLAN_BLUEPRINT: List[Dict[str, Any]] = [
     },
     {
         "title": "检索或调用工具获取答案",
-        "description": "根据需求选择 now、calc、kb_search 或 multi_search 等工具，提取关键事实。",
-        "tool_names": ["now", "calc", "kb_search", "multi_search"],
+        "description": "根据需求选择 now、calc、http_search、doc_insights 或 internal_api 等工具，提取关键事实。",
+        "tool_names": ["now", "calc", "http_search", "doc_insights"],
     },
     {
         "title": "整理输出最终回复",
@@ -449,6 +592,8 @@ def memory_bootstrap(state: AgentState) -> AgentState:
 
 
 def prepare_retrieval(state: AgentState) -> AgentState:
+    if not ENABLE_DOCUMENT_RETRIEVAL:
+        return {"retrieval_query": None, "retrieval_results": []}
     user_id = state.get("user_id")
     if not user_id:
         return {"retrieval_results": []}
@@ -539,9 +684,10 @@ def planner(state: AgentState) -> AgentState:
     outline: Optional[PlanOutline]
     planner_note: Optional[str] = None
     try:
-        outline = planner_chain.invoke({"goal": goal})
+        raw_outline = planner_chain.invoke({"goal": goal})
+        outline = _parse_plan_outline(raw_outline)
     except Exception as exc:  # pragma: no cover
-        logger.warning("Planner structured output failed: %s", exc)
+        logger.warning("Planner JSON output failed: %s", exc)
         planner_note = "Planner output could not be parsed; switched to a default four-step template."
         objective = goal or "default objective"
         fallback_steps = [
@@ -800,6 +946,10 @@ def _infer_required_tools(messages: List[AnyMessage]) -> List[str]:
 def _infer_default_args(tool_name: str, messages: List[AnyMessage]) -> Optional[Dict[str, Any]]:
     if tool_name == "now":
         return {}
+    if tool_name == "http_search":
+        query = _extract_user_goal(messages)
+        if query:
+            return {"query": query, "max_results": 5}
     return None
 
 
@@ -969,6 +1119,24 @@ def _skip_task_message(
     return _build_tool_message(call, result, step_id)
 
 
+def _merge_context_args(
+    tool_name: Optional[str],
+    args: Dict[str, Any],
+    state: AgentState,
+) -> Dict[str, Any]:
+    if not tool_name:
+        return args
+    provider = TOOL_CONTEXT_PROVIDERS.get(tool_name)
+    if not provider:
+        return args
+    additions = provider(state) or {}
+    if not additions:
+        return args
+    merged = dict(additions)
+    merged.update(args or {})
+    return merged
+
+
 def _run_parallel_batch(batch: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
     futures = {
         _SHARED_TOOL_EXECUTOR.submit(
@@ -989,6 +1157,7 @@ def _run_parallel_batch(batch: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any
 def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
     messages = state.get("messages", [])
     tool_calls = _extract_tool_calls(messages)
+    user_provided_tool_calls = bool(tool_calls)
     required = set(_infer_required_tools(messages))
     already_executed = set(_tools_already_executed(messages))
     present = {call["name"] for call in tool_calls if call.get("name")}
@@ -1020,6 +1189,9 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
     tasks: List[Dict[str, Any]] = []
     seen_calls = set()
     for call in tool_calls:
+        args = call.get("args") or {}
+        merged_args = _merge_context_args(call.get("name"), args, state)
+        call["args"] = merged_args
         spec = _get_spec(call["name"] or "")
         key = (call.get("name"), json.dumps(call["args"], sort_keys=True))
         if key in seen_calls:
@@ -1040,6 +1212,7 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
     trimmed_tasks = ordered_tasks[max_tasks:]
 
     results: Dict[int, ToolMessage] = {}
+    synthetic_assistant: Optional[AIMessage] = None
     for task in trimmed_tasks:
         idx = task["call"]["index"]
         results[idx] = _skip_task_message(
@@ -1066,6 +1239,19 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
 
     if not selected_tasks:
         ordered = [results[idx] for idx in sorted(results.keys())]
+        if not user_provided_tool_calls and tool_calls:
+            synthetic_assistant = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": call["id"],
+                        "name": call["name"],
+                        "args": call["args"],
+                    }
+                    for call in tool_calls
+                ],
+            )
+            ordered.insert(0, synthetic_assistant)
         return {"messages": ordered}
 
     parallel_queue = deque(task for task in selected_tasks if not task["spec"].exclusive)
@@ -1143,6 +1329,19 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
         )
 
     ordered = [results[idx] for idx in sorted(results.keys())]
+    if not user_provided_tool_calls and tool_calls:
+        synthetic_assistant = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": call["id"],
+                    "name": call["name"],
+                    "args": call["args"],
+                }
+                for call in tool_calls
+            ],
+        )
+        ordered.insert(0, synthetic_assistant)
     return {"messages": ordered}
 
 
@@ -1180,6 +1379,32 @@ def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
                 },
             )
         )
+
+    # 丰富的配对逻辑：为所有孤立的 ToolMessage 补齐对应的 AIMessage.tool_calls
+    filtered_fixed: List[AnyMessage] = []
+    seen_call_ids: set = set()
+    for msg in filtered:
+        if isinstance(msg, AIMessage):
+            for call in getattr(msg, "tool_calls", []) or []:
+                cid = call.get("id")
+                if cid:
+                    seen_call_ids.add(cid)
+            filtered_fixed.append(msg)
+            continue
+        if isinstance(msg, ToolMessage):
+            call_id = getattr(msg, "tool_call_id", None) or f"auto_{uuid.uuid4().hex[:8]}"
+            name = getattr(msg, "name", None) or "auto_tool"
+            if call_id not in seen_call_ids:
+                synthetic_ai = AIMessage(
+                    content="",
+                    tool_calls=[{"id": call_id, "name": name, "args": {}}],
+                )
+                filtered_fixed.append(synthetic_ai)
+                seen_call_ids.add(call_id)
+            filtered_fixed.append(msg)
+            continue
+        filtered_fixed.append(msg)
+    filtered = filtered_fixed
 
     payload = {
         "system_prompt": SYSTEM_PROMPT,
