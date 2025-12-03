@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 import atexit
@@ -10,6 +11,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import threading
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Annotated, Callable, Dict, List, Literal, Optional, Set, Tuple, TypedDict
 
 from dotenv import load_dotenv
@@ -17,6 +19,10 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+except Exception:  # pragma: no cover - optional dependency
+    SqliteSaver = None
 from langgraph.types import interrupt, Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -74,6 +80,11 @@ logger = logging.getLogger(__name__)
 
 ENABLE_DOCUMENT_RETRIEVAL = os.getenv("ENABLE_DOCUMENT_RETRIEVAL", "true").strip().lower()
 ENABLE_DOCUMENT_RETRIEVAL = ENABLE_DOCUMENT_RETRIEVAL not in {"0", "false", "no"}
+
+CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH") or str(
+    Path(__file__).resolve().parent.parent / "data" / "checkpoints.sqlite3"
+)
+CHECKPOINT_DB_PATH = os.path.abspath(CHECKPOINT_DB_PATH)
 
 SYSTEM_PROMPT = (
     "你是一名公众号写作助手。"
@@ -1415,6 +1426,53 @@ def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
     return {"messages": [response]}
 
 
+_checkpoint_conn: Optional[sqlite3.Connection] = None
+
+
+def _build_checkpointer():
+    """Prefer persistent SQLite checkpointer; fall back to memory if unavailable."""
+    global _checkpoint_conn
+    if SqliteSaver is None:
+        logger.warning("SqliteSaver not installed; falling back to in-memory checkpoints.")
+        return MemorySaver()
+
+    db_path = Path(CHECKPOINT_DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _checkpoint_conn = sqlite3.connect(
+            str(db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        try:
+            _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+            _checkpoint_conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("SQLite checkpointer pragmas not applied", exc_info=True)
+        logger.info("Using SQLite checkpointer at %s", db_path)
+        return SqliteSaver(_checkpoint_conn)
+    except Exception as exc:  # pragma: no cover
+        logger.exception(
+            "SQLite checkpointer init failed; falling back to memory saver.",
+            exc_info=exc,
+        )
+        _checkpoint_conn = None
+        return MemorySaver()
+
+
+def _close_checkpointer() -> None:
+    global _checkpoint_conn
+    conn = _checkpoint_conn
+    _checkpoint_conn = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to close checkpointer connection: %s", exc)
+
+
+atexit.register(_close_checkpointer)
+
 graph = StateGraph(AgentState)
 graph.add_node("memory_bootstrap", memory_bootstrap)
 graph.add_node("planner", planner)
@@ -1447,5 +1505,5 @@ graph.add_edge("tools", "agent")
 graph.add_edge("step_reporter", "memory_writer")
 graph.add_edge("memory_writer", "executor")
 
-memory = MemorySaver()
+memory = _build_checkpointer()
 compiled_graph = graph.compile(checkpointer=memory)

@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import pdfplumber
+import pytesseract
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -31,6 +33,11 @@ _VECTOR_DIR.mkdir(parents=True, exist_ok=True)
 
 _TEXT_SPLITTER: Optional[RecursiveCharacterTextSplitter] = None
 _EMBEDDINGS: Optional[HuggingFaceEmbeddings] = None
+_OCR_AVAILABLE = True
+try:
+    pytesseract.get_tesseract_version()
+except Exception:
+    _OCR_AVAILABLE = False
 
 
 class UserVectorStoreRetriever(BaseRetriever):
@@ -245,10 +252,7 @@ def process_document_file(
         "processing document doc_id=%s user=%s path=%s", document_id, user_id, file_path
     )
 
-    try:
-        text = file_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    text = _extract_text(file_path)
 
     splitter = _get_text_splitter()
     chunks = [chunk.strip() for chunk in splitter.split_text(text) if chunk.strip()]
@@ -324,6 +328,50 @@ def store_memory_snippet(
         [Document(page_content=cleaned, metadata=chunk_metadata)],
     )
     return chunk_id
+
+
+def _extract_text(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                pages = [page.extract_text() or "" for page in pdf.pages]
+            text = "\n\n".join(page for page in pages if page)
+            if text.strip():
+                return text
+            logger.warning("pdf text empty after extraction path=%s", file_path)
+        except Exception as exc:
+            logger.warning("pdf extraction failed path=%s err=%s", file_path, exc)
+        # Fallback to OCR for scanned / image-only PDFs.
+        ocr_text = _ocr_pdf(file_path)
+        if ocr_text.strip():
+            return ocr_text
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return file_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _ocr_pdf(file_path: Path) -> str:
+    """Use Tesseract OCR as a best-effort fallback for image-only PDFs."""
+    if not _OCR_AVAILABLE:
+        logger.warning("tesseract not available; skipping OCR path=%s", file_path)
+        return ""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            texts: List[str] = []
+            for idx, page in enumerate(pdf.pages):
+                try:
+                    image = page.to_image(resolution=200).original.convert("RGB")
+                    ocr = pytesseract.image_to_string(image)
+                    if ocr.strip():
+                        texts.append(ocr)
+                except Exception as exc:
+                    logger.warning("ocr failed page=%s path=%s err=%s", idx, file_path, exc)
+            return "\n\n".join(chunk.strip() for chunk in texts if chunk.strip())
+    except Exception as exc:
+        logger.warning("ocr open pdf failed path=%s err=%s", file_path, exc)
+        return ""
 
 
 def retrieve(

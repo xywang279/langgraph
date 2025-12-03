@@ -1,15 +1,9 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Card,
   Input,
   Button,
-  Space,
+  Flex,
   List,
   Tag,
   message as antdMessage,
@@ -18,64 +12,53 @@ import {
   Tooltip,
   Steps,
   Modal,
-  Upload,
   Checkbox,
-  Divider,
-  Progress,
-  Empty,
-  Tabs,
-  InputNumber,
-  Form,
   Alert,
+  theme as antdTheme,
+  Divider,
+  Space,
 } from 'antd'
 import {
   SendOutlined,
   StopOutlined,
   ReloadOutlined,
-  CloudUploadOutlined,
-  SaveOutlined,
-  UserOutlined,
-  DatabaseOutlined,
-  InboxOutlined,
-  LineChartOutlined,
+  CopyOutlined,
+  RedoOutlined,
+  DeleteOutlined,
+  FileTextOutlined,
+  ClockCircleOutlined,
+  MessageOutlined,
+  GlobalOutlined,
+  SearchOutlined,
+  FileTextTwoTone,
+  PlusOutlined,
+  EditOutlined,
 } from '@ant-design/icons'
-
-import { API_BASE, fetchToolBudgetConfig, updateToolBudgetConfig } from '../api'
+import { API_BASE, API_KEY, createThread, fetchThreadMessages, fetchThreads, deleteThread, renameThread } from '../api'
 
 const { Text, Paragraph } = Typography
-const { Dragger } = Upload
+const { TextArea } = Input
 
 const uid = () => Math.random().toString(36).slice(2)
-
 const INITIAL_PLAN = { steps: [], currentStep: 0, activeStepId: null }
 
 const ROLE_CONFIG = {
   user: {
     tag: { color: 'processing', label: 'USER' },
-    bubble: { background: '#e0f2ff', color: '#0f172a', alignSelf: 'flex-end', border: '1px solid #bfdbfe' },
+    bubble: { background: '#e0f2ff', color: '#0f172a', alignSelf: 'flex-end', border: '1px solid #bfdbfe', textAlign: 'right' },
   },
   ai: {
     tag: { color: 'success', label: 'ASSISTANT' },
-    bubble: { background: '#dcfce7', color: '#065f46', alignSelf: 'flex-start', border: '1px solid #bbf7d0' },
+    bubble: { background: '#dcfce7', color: '#065f46', alignSelf: 'flex-start', border: '1px solid #bbf7d0', textAlign: 'left' },
   },
   tool: {
     tag: { color: 'geekblue', label: 'TOOL' },
-    bubble: { background: '#fff9db', color: '#854d0e', alignSelf: 'stretch', border: '1px solid #fde68a' },
+    bubble: { background: '#fff9db', color: '#854d0e', alignSelf: 'flex-start', border: '1px solid #fde68a', textAlign: 'left' },
   },
   system: {
     tag: { color: 'purple', label: 'SYSTEM' },
-    bubble: { background: '#ede9fe', color: '#3730a3', alignSelf: 'flex-start', border: '1px solid #ddd6fe' },
+    bubble: { background: '#ede9fe', color: '#3730a3', alignSelf: 'flex-start', border: '1px solid #ddd6fe', textAlign: 'left' },
   },
-}
-
-const THEME = {
-  cardBg: '#ffffff',
-  cardBorder: '#e2e8f0',
-  panelBg: '#f8fafc',
-  accentBg: '#dbeafe',
-  inputBg: '#ffffff',
-  inputText: '#0f172a',
-  mutedText: '#475569',
 }
 
 const STEP_STATUS_TEXT = {
@@ -96,110 +79,340 @@ const STEP_STATUS_MAP = {
   failed: 'error',
 }
 
-const usePersistentUserId = () => {
-  const readId = () => {
-    try {
-      return window.localStorage.getItem('lg-user-id') || 'user-default'
-    } catch (err) {
-      console.warn('unable to read user-id from storage', err)
-      return 'user-default'
+const heroPrompts = [
+  { title: 'Plan a trip', desc: 'Complex planning with steps', prompt: 'Plan a 3-day trip to Tokyo with budget and itinerary', icon: <GlobalOutlined /> },
+  { title: 'Web Research', desc: 'Live tool usage & citations', prompt: 'Find the latest LangGraph community updates', icon: <SearchOutlined /> },
+  { title: 'Human-in-the-loop', desc: 'Interrupt & approval workflow', prompt: 'Prepare a rollout plan and ask me to approve before execution', icon: <MessageOutlined /> },
+  { title: 'Document Q&A', desc: 'Context aware chat', prompt: 'Summarize my latest uploaded document', icon: <FileTextTwoTone /> },
+]
+
+const MessageBubble = ({
+  item,
+  isSelected,
+  antdToken,
+  toggleSelect,
+  deleteMessages,
+  startStream,
+  lastUserPrompt,
+  renderSources,
+  roleStyle,
+  isError,
+}) => {
+  const relativeTime = item.ts
+    ? (() => {
+        const diff = Date.now() - item.ts
+        if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`
+        if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+        return new Date(item.ts).toLocaleTimeString()
+      })()
+    : ''
+
+  const handleCopy = () => {
+    if (item.content) {
+      navigator.clipboard?.writeText(item.content)
+      antdMessage.success('Copied')
     }
   }
 
-  const [userId, setUserId] = useState(readId)
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem('lg-user-id', userId)
-    } catch (err) {
-      console.warn('unable to persist user-id', err)
+  const handleRetry = () => {
+    if (item.role === 'user' && item.content) {
+      startStream(item.content)
+    } else if (lastUserPrompt) {
+      startStream(lastUserPrompt)
     }
-  }, [userId])
+  }
 
-  return [userId, setUserId]
+  return (
+    <Flex vertical align={roleStyle.bubble.alignSelf === 'flex-end' ? 'flex-end' : 'flex-start'} style={{ width: '100%' }}>
+      <Flex gap={6} align="center">
+        <Checkbox checked={isSelected} onChange={() => toggleSelect(item.id)} />
+        <Tag color={roleStyle.tag.color}>{roleStyle.tag.label}</Tag>
+        {item.stepId && <Tag color="cyan">{item.stepId}</Tag>}
+        {item.tool && <Tag color="blue">{item.tool}</Tag>}
+        {item.status && <Tag color={isError ? 'red' : 'gold'}>{item.status}</Tag>}
+        <Tag color="default" style={{ color: antdToken.colorTextSecondary }}>
+          <ClockCircleOutlined /> {relativeTime || (item.ts ? new Date(item.ts).toLocaleString() : '')}
+        </Tag>
+      </Flex>
+      <div
+        style={{
+          background: isError ? antdToken.colorErrorBg : roleStyle.bubble.background,
+          color: isError ? antdToken.colorError : roleStyle.bubble.color,
+          borderRadius: 12,
+          border: isError ? `1px solid ${antdToken.colorErrorBorder}` : roleStyle.bubble.border || `1px solid ${antdToken.colorBorder}`,
+          padding: 12,
+          minWidth: 160,
+          maxWidth: '70%',
+          whiteSpace: 'pre-wrap',
+          textAlign: roleStyle.bubble.textAlign,
+          marginTop: 4,
+          position: 'relative',
+          boxShadow: isSelected ? `0 0 0 2px ${antdToken.colorPrimary}` : 'none',
+        }}
+      >
+        <Flex gap={4} justify="flex-end" style={{ marginBottom: 6 }}>
+          <Tooltip title="Copy">
+            <Button size="small" type="text" onClick={handleCopy} icon={<CopyOutlined />} />
+          </Tooltip>
+          {isError && (
+            <Tooltip title="Retry">
+              <Button size="small" type="text" onClick={handleRetry} icon={<RedoOutlined />} />
+            </Tooltip>
+          )}
+          <Tooltip title="Delete">
+            <Button size="small" type="text" icon={<DeleteOutlined />} onClick={() => deleteMessages(new Set([item.id]))} />
+          </Tooltip>
+        </Flex>
+        {item.content ? <Text style={{ color: isError ? antdToken.colorError : roleStyle.bubble.color }}>{item.content}</Text> : <Spin size="small" />}
+        {renderSources(item.sources)}
+      </div>
+    </Flex>
+  )
 }
 
-export default function Chat() {
-  const [userId, setUserId] = usePersistentUserId()
-  const [sessionId, setSessionId] = useState(() => `web-${uid()}`)
-  const [text, setText] = useState('What time is it? Please use the tools.')
+export default function Chat({ token, userId, setUserId }) {
+  const [sessionId, setSessionId] = useState(null)
+  const [text, setText] = useState('')
   const [messages, setMessages] = useState([])
   const [planState, setPlanState] = useState(INITIAL_PLAN)
   const [status, setStatus] = useState('idle')
-  const [lastUpdate, setLastUpdate] = useState(null)
   const [loading, setLoading] = useState(false)
   const [resumeLoading, setResumeLoading] = useState(false)
   const [interruptInfo, setInterruptInfo] = useState(null)
   const [interruptVisible, setInterruptVisible] = useState(false)
   const [rememberNext, setRememberNext] = useState(false)
-  const [documents, setDocuments] = useState([])
-  const [documentsLoading, setDocumentsLoading] = useState(false)
-  const [toolBudget, setToolBudget] = useState(null)
-  const [toolBudgetDraft, setToolBudgetDraft] = useState({
-    max_tasks: 6,
-    max_parallel: 3,
-    total_latency: 12,
-  })
-  const [toolBudgetLoading, setToolBudgetLoading] = useState(false)
-  const [toolBudgetSaving, setToolBudgetSaving] = useState(false)
+  const [sseNotice, setSseNotice] = useState('idle')
+  const [lastUserPrompt, setLastUserPrompt] = useState('')
+  const [selectedIds, setSelectedIds] = useState(new Set())
+  const [threads, setThreads] = useState([])
+  const [threadsLoading, setThreadsLoading] = useState(false)
+  const [threadActionId, setThreadActionId] = useState(null)
 
   const esRef = useRef(null)
   const liveMessageRef = useRef(null)
   const lastResultRef = useRef({})
   const sourcesRef = useRef([])
+  const chatAreaRef = useRef(null)
 
+  const { token: antdToken } = antdTheme.useToken()
   const planSteps = planState.steps
+  const resolvedToken = useMemo(() => token || API_KEY || '', [token])
+  const activeThread = useMemo(() => threads.find((item) => item.thread_id === sessionId), [threads, sessionId])
 
-  const resetSession = useCallback(() => {
-    setSessionId(`web-${uid()}`)
-    setMessages([])
-    setPlanState(INITIAL_PLAN)
-    setStatus('idle')
-    setLastUpdate(null)
-    lastResultRef.current = {}
-    liveMessageRef.current = null
-    sourcesRef.current = []
-    if (esRef.current) {
-      esRef.current.close()
-      esRef.current = null
+  const statusBanner = useMemo(() => {
+    const statusTextMap = {
+      planning: 'Planning...',
+      planning_completed: 'Plan ready',
+      executing: 'Executing',
+      waiting: 'Waiting for input',
+      completed: 'Completed',
+      idle: 'Idle',
     }
-  }, [])
-
-  const appendMessage = useCallback(
-    (message) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: message.id || uid(),
-          ts: Date.now(),
-          ...message,
-        },
-      ])
-    },
-    [setMessages]
-  )
-
-  const updatePlanWithPayload = useCallback(
-    (payload) => {
-      setPlanState((prev) => {
-        const steps = Array.isArray(payload.plan) ? payload.plan : prev.steps
-        return {
-          steps,
-          currentStep:
-            typeof payload.current_step === 'number'
-              ? payload.current_step
-              : prev.currentStep,
-          activeStepId: payload.active_step_id || prev.activeStepId,
+    const textLabel = statusTextMap[status] || status
+    const type =
+      status === 'completed'
+        ? 'success'
+        : status === 'waiting'
+        ? 'warning'
+        : status === 'executing' || status === 'planning' || sseNotice === 'streaming'
+        ? 'info'
+        : status === 'error'
+        ? 'error'
+        : 'info'
+    return (
+      <Alert
+        type={type}
+        showIcon
+        message={textLabel}
+        description={
+          sseNotice === 'error'
+            ? 'Stream interrupted or failed.'
+            : sseNotice === 'streaming'
+            ? 'Receiving live response...'
+            : undefined
         }
-      })
-    },
-    []
-  )
+        style={{ borderRadius: 8, background: antdToken.colorFillTertiary }}
+      />
+    )
+  }, [status, sseNotice, antdToken])
 
   const clearLiveMessage = useCallback(() => {
     liveMessageRef.current = null
     sourcesRef.current = []
     setMessages((prev) => prev.filter((item) => item.id !== 'ai-live'))
+  }, [])
+
+  const stopStream = useCallback(() => {
+    if (esRef.current) {
+      esRef.current.close()
+      esRef.current = null
+      setLoading(false)
+      setResumeLoading(false)
+      clearLiveMessage()
+      setSseNotice('stopped')
+    }
+  }, [clearLiveMessage])
+
+  const loadThreadMessages = useCallback(
+    async (threadId) => {
+      if (!threadId || !userId) return
+      setMessages([])
+      setPlanState(INITIAL_PLAN)
+      setStatus('idle')
+      setSseNotice('idle')
+      setSelectedIds(new Set())
+      lastResultRef.current = {}
+      liveMessageRef.current = null
+      sourcesRef.current = []
+      try {
+        const res = await fetchThreadMessages(threadId, userId, resolvedToken)
+        const list = Array.isArray(res.items) ? res.items : []
+        setMessages(
+          list.map((item) => ({
+            id: item.id || uid(),
+            role: item.role || 'system',
+            content: item.content || '',
+            ts: item.created_at ? item.created_at * 1000 : Date.now(),
+            metadata: item.metadata,
+          }))
+        )
+      } catch (err) {
+        antdMessage.error(err?.message || 'Failed to load messages')
+      }
+    },
+    [userId, resolvedToken]
+  )
+
+  const refreshThreads = useCallback(async () => {
+    if (!userId) {
+      setThreads([])
+      return
+    }
+    setThreadsLoading(true)
+    try {
+      const res = await fetchThreads(userId, resolvedToken)
+      const items = Array.isArray(res.items) ? res.items : []
+      setThreads(items)
+      if (!sessionId && items.length > 0) {
+        const nextId = items[0].thread_id || items[0].id
+        setSessionId(nextId)
+        await loadThreadMessages(nextId)
+      }
+    } catch (err) {
+      antdMessage.error(err?.message || 'Failed to load threads')
+    } finally {
+      setThreadsLoading(false)
+    }
+  }, [userId, resolvedToken, sessionId, loadThreadMessages])
+
+  const selectThread = useCallback(
+    async (threadId) => {
+      if (!threadId) return
+      stopStream()
+      setSessionId(threadId)
+      await loadThreadMessages(threadId)
+    },
+    [stopStream, loadThreadMessages]
+  )
+
+  const startNewThread = useCallback(
+    async (titleHint = '') => {
+      if (!userId) {
+        antdMessage.warning('User ID is required')
+        return null
+      }
+      setThreadActionId('new')
+      try {
+        const res = await createThread(userId, resolvedToken, titleHint)
+        const newId = res.thread_id || res.id
+        if (newId) {
+          setSessionId(newId)
+          await loadThreadMessages(newId)
+          refreshThreads()
+        }
+        return newId || null
+      } catch (err) {
+        antdMessage.error(err?.message || 'Failed to create thread')
+        return null
+      } finally {
+        setThreadActionId(null)
+      }
+    },
+    [userId, resolvedToken, loadThreadMessages, refreshThreads]
+  )
+
+  const handleDeleteThread = useCallback(
+    async (threadId) => {
+      if (!threadId || !userId) return
+      setThreadActionId(threadId)
+      try {
+        await deleteThread(threadId, userId, resolvedToken)
+        if (sessionId === threadId) {
+          setSessionId(null)
+          setMessages([])
+          setPlanState(INITIAL_PLAN)
+        }
+        refreshThreads()
+      } catch (err) {
+        antdMessage.error(err?.message || 'Failed to delete thread')
+      } finally {
+        setThreadActionId(null)
+      }
+    },
+    [userId, resolvedToken, sessionId, refreshThreads]
+  )
+
+  const handleRenameThread = useCallback(
+    async (thread) => {
+      if (!thread) return
+      const next = window.prompt('New thread title', thread.title || 'Untitled chat')
+      if (!next || next.trim() === (thread.title || '').trim()) return
+      setThreadActionId(thread.thread_id)
+      try {
+        await renameThread(thread.thread_id, userId, next.trim(), resolvedToken)
+        refreshThreads()
+      } catch (err) {
+        antdMessage.error(err?.message || 'Rename failed')
+      } finally {
+        setThreadActionId(null)
+      }
+    },
+    [userId, resolvedToken, refreshThreads]
+  )
+
+  useEffect(() => {
+    if (!userId) {
+      setThreads([])
+      setSessionId(null)
+      setMessages([])
+      setPlanState(INITIAL_PLAN)
+      setStatus('idle')
+      setSseNotice('idle')
+      return
+    }
+    refreshThreads()
+  }, [userId, refreshThreads])
+
+  const appendMessage = useCallback((message) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: message.id || uid(),
+        ts: Date.now(),
+        ...message,
+      },
+    ])
+  }, [])
+
+  const updatePlanWithPayload = useCallback((payload) => {
+    setPlanState((prev) => {
+      const steps = Array.isArray(payload.plan) ? payload.plan : prev.steps
+      return {
+        steps,
+        currentStep: typeof payload.current_step === 'number' ? payload.current_step : prev.currentStep,
+        activeStepId: payload.active_step_id || prev.activeStepId,
+      }
+    })
   }, [])
 
   const finalizeLiveMessage = useCallback(
@@ -232,17 +445,8 @@ export default function Chat() {
       if (!payload || !payload.step_id) return
 
       setPlanState((prev) => {
-        const steps = prev.steps.map((step) =>
-          step.id === payload.step_id ? { ...step, ...payload } : step
-        )
+        const steps = prev.steps.map((step) => (step.id === payload.step_id ? { ...step, ...payload } : step))
         return { ...prev, steps }
-      })
-
-      setLastUpdate({
-        stepId: payload.step_id,
-        status: payload.status,
-        result: payload.result,
-        timestamp: Date.now(),
       })
 
       if (typeof payload.result === 'string' && payload.result.trim()) {
@@ -316,6 +520,7 @@ export default function Chat() {
         case 'plan':
           handlePlanEvent(event)
           setStatus('planning_completed')
+          setSseNotice('planning_completed')
           break
         case 'status':
           setStatus(event.status || 'idle')
@@ -340,17 +545,19 @@ export default function Chat() {
           clearLiveMessage()
           break
         case 'retrieval':
-          sourcesRef.current =
-            (event.payload && event.payload.retrieval_results) || []
+          sourcesRef.current = (event.payload && event.payload.retrieval_results) || []
           break
         case 'end':
           finalizeLiveMessage()
           setLoading(false)
           setResumeLoading(false)
+          setSseNotice('completed')
+          refreshThreads()
           break
         case 'error':
           setLoading(false)
           setResumeLoading(false)
+          setSseNotice('error')
           antdMessage.error(event.message || 'Execution error')
           clearLiveMessage()
           break
@@ -362,13 +569,7 @@ export default function Chat() {
           }
       }
     },
-    [
-      handlePlanEvent,
-      handleStepUpdate,
-      handleMessageChunk,
-      finalizeLiveMessage,
-      clearLiveMessage,
-    ]
+    [handlePlanEvent, handleStepUpdate, handleMessageChunk, finalizeLiveMessage, clearLiveMessage, refreshThreads]
   )
 
   const attachEventSource = useCallback(
@@ -387,11 +588,23 @@ export default function Chat() {
         setLoading(false)
         setResumeLoading(false)
         clearLiveMessage()
+        setSseNotice('error')
         es.close()
         esRef.current = null
       }
     },
     [handleStreamEvent, clearLiveMessage]
+  )
+
+  const buildStreamUrl = useCallback(
+    (basePath, params) => {
+      const search = new URLSearchParams(params)
+      if (resolvedToken) {
+        search.set('api_key', resolvedToken)
+      }
+      return `${API_BASE}${basePath}?${search.toString()}`
+    },
+    [resolvedToken]
   )
 
   const initializeStream = useCallback(
@@ -406,6 +619,7 @@ export default function Chat() {
       if (resetPlan) {
         setPlanState(INITIAL_PLAN)
         setStatus('planning')
+        setSseNotice('planning')
         lastResultRef.current = {}
       }
 
@@ -437,65 +651,131 @@ export default function Chat() {
     [attachEventSource]
   )
 
-  const buildStreamUrl = useCallback(
-    (basePath, params) => {
-      const search = new URLSearchParams(params)
-      return `${API_BASE}${basePath}?${search.toString()}`
+  const startStream = useCallback(
+    async (overridePrompt) => {
+      const promptValue = typeof overridePrompt === 'string' ? overridePrompt : text
+      const prompt = (promptValue || '').trim()
+      if (!prompt) {
+        antdMessage.warning('Please enter a prompt')
+        return
+      }
+
+      if (!userId?.trim()) {
+        antdMessage.warning('User ID is required')
+        return
+      }
+
+      setLoading(true)
+      setSseNotice('streaming')
+      setResumeLoading(false)
+      setInterruptVisible(false)
+      setInterruptInfo(null)
+
+      let threadId = sessionId
+      if (!threadId) {
+        threadId = await startNewThread(prompt.slice(0, 60))
+      }
+      if (!threadId) {
+        setLoading(false)
+        setSseNotice('idle')
+        return
+      }
+
+      const url = buildStreamUrl('/chat/stream', {
+        session_id: threadId,
+        user_id: userId,
+        message: prompt,
+        remember: rememberNext ? '1' : '0',
+      })
+
+      initializeStream({
+        url,
+        userMessage: prompt,
+        resetPlan: true,
+        expectStream: true,
+      })
+      setSessionId(threadId)
+      setLastUserPrompt(prompt)
+      if (typeof overridePrompt === 'undefined') {
+        setText('')
+      }
+      if (rememberNext) {
+        setRememberNext(false)
+      }
     },
-    []
+    [text, userId, sessionId, rememberNext, initializeStream, buildStreamUrl, startNewThread]
   )
 
-  const startStream = useCallback(() => {
-    if (!text.trim()) {
-      antdMessage.warning('Please enter a prompt')
+  const resendLast = useCallback(() => {
+    if (!lastUserPrompt) {
+      antdMessage.info('No previous prompt to resend')
       return
     }
+    startStream(lastUserPrompt)
+  }, [lastUserPrompt, startStream])
 
-    if (!userId.trim()) {
-      antdMessage.warning('User ID is required')
+  const toggleSelect = useCallback((id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }, [])
+
+  const deleteMessages = useCallback((ids) => {
+    if (!ids || ids.size === 0) return
+    setMessages((prev) => prev.filter((m) => !ids.has(m.id)))
+    setSelectedIds(new Set())
+  }, [])
+
+  const copyMessages = useCallback((msgs) => {
+    if (!msgs || msgs.length === 0) {
+      antdMessage.info('No messages to copy')
       return
     }
+    const txt = msgs.map((m) => `[${m.role}] ${m.content || ''}`).join('\n\n')
+    navigator.clipboard?.writeText(txt)
+    antdMessage.success('Copied')
+  }, [])
 
-    setLoading(true)
-    setResumeLoading(false)
-    setInterruptVisible(false)
-    setInterruptInfo(null)
+  const exportJSON = useCallback(
+    (msgs) => {
+      const payload = msgs.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        ts: m.ts,
+        status: m.status,
+        stepId: m.stepId,
+        tool: m.tool,
+      }))
+      copyMessages([{ role: 'export', content: JSON.stringify(payload, null, 2) }])
+    },
+    [copyMessages]
+  )
 
-    const url = buildStreamUrl('/chat/stream', {
-      session_id: sessionId,
-      user_id: userId,
-      message: text,
-      remember: rememberNext ? '1' : '0',
-    })
+  const exportMarkdown = useCallback(
+    (msgs) => {
+      const md = msgs
+        .map((m) => `### ${m.role}${m.stepId ? ` (${m.stepId})` : ''}\n${m.content || ''}`)
+        .join('\n\n')
+      copyMessages([{ role: 'export', content: md }])
+    },
+    [copyMessages]
+  )
 
-    initializeStream({
-      url,
-      userMessage: text,
-      resetPlan: true,
-      expectStream: true,
-    })
-    setText('')
-    if (rememberNext) {
-      setRememberNext(false)
-    }
-  }, [
-    text,
-    userId,
-    sessionId,
-    rememberNext,
-    initializeStream,
-    buildStreamUrl,
-  ])
-
-  const stopStream = useCallback(() => {
-    if (esRef.current) {
-      esRef.current.close()
-      esRef.current = null
-      setLoading(false)
-      setResumeLoading(false)
-      clearLiveMessage()
-    }
-  }, [clearLiveMessage])
+  const copySelectedOrLast = useCallback(
+    (count = 5) => {
+      const pool = messages
+      const candidates = selectedIds.size > 0 ? pool.filter((m) => selectedIds.has(m.id)) : pool.slice(-count)
+      copyMessages(candidates)
+    },
+    [messages, selectedIds, copyMessages]
+  )
 
   const resume = useCallback(
     (action) => {
@@ -532,135 +812,11 @@ export default function Chat() {
     [sessionId, userId, initializeStream, buildStreamUrl]
   )
 
-  const refreshToolBudget = useCallback(async () => {
-    setToolBudgetLoading(true)
-    try {
-      const data = await fetchToolBudgetConfig()
-      setToolBudget(data)
-      setToolBudgetDraft(data)
-    } catch (err) {
-      console.warn('failed to load tool budget', err)
-      antdMessage.error('Failed to load tool budget settings')
-    } finally {
-      setToolBudgetLoading(false)
-    }
-  }, [])
-
   useEffect(() => {
-    refreshToolBudget()
-  }, [refreshToolBudget])
-
-  const refreshDocuments = useCallback(async () => {
-    if (!userId) return
-    setDocumentsLoading(true)
-    try {
-      const res = await fetch(
-        `${API_BASE}/documents?${new URLSearchParams({ user_id: userId })}`
-      )
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const body = await res.json()
-      setDocuments(Array.isArray(body.items) ? body.items : [])
-    } catch (err) {
-      console.warn('document list fetch failed', err)
-      antdMessage.error('Failed to load documents')
-    } finally {
-      setDocumentsLoading(false)
+    if (chatAreaRef.current) {
+      chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight
     }
-  }, [userId])
-
-  useEffect(() => {
-    refreshDocuments()
-    const timer = setInterval(refreshDocuments, 5000)
-    return () => clearInterval(timer)
-  }, [refreshDocuments])
-
-  const handleBudgetFieldChange = useCallback((field, value) => {
-    setToolBudgetDraft((prev) => ({
-      ...prev,
-      [field]: typeof value === 'number' ? value : prev[field],
-    }))
-  }, [])
-
-  const budgetChanged = useMemo(() => {
-    if (!toolBudget) return false
-    return (
-      toolBudget.max_tasks !== toolBudgetDraft.max_tasks ||
-      toolBudget.max_parallel !== toolBudgetDraft.max_parallel ||
-      toolBudget.total_latency !== toolBudgetDraft.total_latency
-    )
-  }, [toolBudget, toolBudgetDraft])
-
-  const handleBudgetSave = useCallback(async () => {
-    if (!toolBudget) return
-    const payload = {}
-    if (toolBudgetDraft.max_tasks !== toolBudget.max_tasks) {
-      payload.max_tasks = toolBudgetDraft.max_tasks
-    }
-    if (toolBudgetDraft.max_parallel !== toolBudget.max_parallel) {
-      payload.max_parallel = toolBudgetDraft.max_parallel
-    }
-    if (toolBudgetDraft.total_latency !== toolBudget.total_latency) {
-      payload.total_latency = toolBudgetDraft.total_latency
-    }
-    if (Object.keys(payload).length === 0) {
-      antdMessage.info('No budget changes to apply')
-      return
-    }
-    setToolBudgetSaving(true)
-    try {
-      const next = await updateToolBudgetConfig(payload)
-      setToolBudget(next)
-      setToolBudgetDraft(next)
-      antdMessage.success('Tool budget updated')
-    } catch (err) {
-      console.error('failed to update tool budget', err)
-      antdMessage.error(err.message || 'Failed to update tool budget')
-    } finally {
-      setToolBudgetSaving(false)
-    }
-  }, [toolBudget, toolBudgetDraft])
-
-  const handleBudgetReset = useCallback(() => {
-    if (toolBudget) {
-      setToolBudgetDraft(toolBudget)
-    }
-  }, [toolBudget])
-
-  const openMetricsFeed = useCallback(() => {
-    const url = `${API_BASE}/metrics`
-    window.open(url, '_blank', 'noopener,noreferrer')
-  }, [])
-
-  const uploadProps = useMemo(
-    () => ({
-      multiple: false,
-      customRequest: async ({ file, onSuccess, onError }) => {
-        if (!userId) {
-          onError(new Error('User ID is required'))
-          return
-        }
-        const form = new FormData()
-        form.append('user_id', userId)
-        form.append('file', file)
-        try {
-          const res = await fetch(`${API_BASE}/documents`, {
-            method: 'POST',
-            body: form,
-          })
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          antdMessage.success('Document upload started')
-          onSuccess()
-          refreshDocuments()
-        } catch (err) {
-          console.error('upload failed', err)
-          onError(err)
-          antdMessage.error('Upload failed')
-        }
-      },
-      showUploadList: false,
-    }),
-    [userId, refreshDocuments]
-  )
+  }, [messages])
 
   const renderSources = (sources) => {
     if (!Array.isArray(sources) || sources.length === 0) return null
@@ -668,14 +824,16 @@ export default function Chat() {
       <div
         style={{
           marginTop: 12,
-          padding: 12,
-          borderRadius: 10,
-          background: THEME.panelBg,
-          border: `1px solid ${THEME.cardBorder}`,
+          padding: 10,
+          borderRadius: 8,
+          background: antdToken.colorFillSecondary,
+          border: '1px solid ' + antdToken.colorBorderSecondary,
         }}
       >
-        <Space direction="vertical" size={8} style={{ width: '100%' }}>
-          <Text type="secondary">Sources</Text>
+        <Flex vertical gap={8} style={{ width: '100%' }}>
+          <Text type="secondary" strong>
+            Sources
+          </Text>
           {sources.map((source, index) => {
             const name =
               (source.metadata && source.metadata.filename) ||
@@ -689,109 +847,91 @@ export default function Chat() {
               <div
                 key={`${source.chunk_id || source.document_id || index}`}
                 style={{
-                  background: THEME.cardBg,
-                  borderRadius: 8,
-                  padding: 10,
-                  border: `1px solid ${THEME.cardBorder}`,
+                  background: antdToken.colorBgContainer,
+                  borderRadius: 6,
+                  padding: 8,
+                  border: '1px solid ' + antdToken.colorBorderSecondary,
                 }}
               >
-                <Space size={8} align="center">
+                <Flex gap={8} align="center" style={{ marginBottom: 4 }}>
                   <Tag color="cyan">{name}</Tag>
-                  <Tag color="geekblue">{score || 'retrieved'}</Tag>
-                </Space>
-                <Paragraph style={{ marginBottom: 0, color: THEME.mutedText }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {score || 'retrieved'}
+                  </Text>
+                </Flex>
+                <Paragraph
+                  ellipsis={{ rows: 2, expandable: true, symbol: 'more' }}
+                  style={{ marginBottom: 0, color: antdToken.colorTextSecondary, fontSize: 13 }}
+                >
                   {source.content || '(empty snippet)'}
                 </Paragraph>
               </div>
             )
           })}
-        </Space>
+        </Flex>
       </div>
     )
   }
 
   const renderMessage = (item) => {
     const roleStyle = ROLE_CONFIG[item.role] || ROLE_CONFIG.system
+    const isError =
+      item.status === 'error' || (item.role === 'system' && /error|failed/i.test(item.content || ''))
+
     return (
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems:
-            roleStyle.bubble.alignSelf === 'flex-end'
-              ? 'flex-end'
-              : 'flex-start',
-          width: '100%',
-        }}
-      >
-        <Space size={6} align="center">
-          <Tag color={roleStyle.tag.color}>{roleStyle.tag.label}</Tag>
-          {item.stepId && (
-            <Tag color="cyan" style={{ fontWeight: 500 }}>
-              {item.stepId}
-            </Tag>
-          )}
-          {item.tool && <Tag color="blue">{item.tool}</Tag>}
-          {item.status && <Tag color="gold">{item.status}</Tag>}
-        </Space>
-        <div
-          style={{
-            background: roleStyle.bubble.background,
-            color: roleStyle.bubble.color,
-            borderRadius: 10,
-            border: roleStyle.bubble.border || `1px solid ${THEME.cardBorder}`,
-            padding: 12,
-            minWidth: 120,
-            maxWidth: '100%',
-            whiteSpace: 'pre-wrap',
-          }}
-        >
-          {item.content ? (
-            <Text style={{ color: roleStyle.bubble.color }}>
-              {item.content}
-            </Text>
-          ) : (
-            <Spin size="small" />
-          )}
-          {renderSources(item.sources)}
-        </div>
-      </div>
+      <MessageBubble
+        item={item}
+        isSelected={selectedIds.has(item.id)}
+        antdToken={antdToken}
+        toggleSelect={toggleSelect}
+        deleteMessages={deleteMessages}
+        startStream={startStream}
+        lastUserPrompt={lastUserPrompt}
+        renderSources={renderSources}
+        roleStyle={roleStyle}
+        isError={isError}
+      />
     )
   }
 
-  const planBanner = useMemo(() => {
-    if (!planSteps.length) return null
-    const finishedSteps = planSteps.filter(
-      (step) => step.status === 'completed'
-    ).length
-    const percent =
-      planSteps.length === 0
-        ? 0
-        : Math.round((finishedSteps / planSteps.length) * 100)
-    const activeStep = planSteps.find(
-      (step) => step.id === planState.activeStepId
-    )
+  const planSidebar = useMemo(() => {
+    if (!planSteps.length) {
+      return (
+        <Flex vertical justify="center" align="center" style={{ height: '100%', gap: 8 }}>
+          <Text type="secondary" strong>
+            No active workflow
+          </Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Start a chat to see the plan here.
+          </Text>
+        </Flex>
+      )
+    }
+    const finishedSteps = planSteps.filter((step) => step.status === 'completed').length
+    const percent = planSteps.length === 0 ? 0 : Math.round((finishedSteps / planSteps.length) * 100)
+    const activeStep = planSteps.find((step) => step.id === planState.activeStepId)
 
     return (
-      <div
-        style={{
-          background: THEME.accentBg,
-          padding: 12,
-          borderRadius: 12,
-          border: `1px solid ${THEME.cardBorder}`,
-        }}
-      >
-        <Space direction="vertical" style={{ width: '100%' }} size={8}>
-          <Space
-            align="center"
-            style={{ width: '100%', justifyContent: 'space-between' }}
-          >
-            <Text style={{ color: THEME.inputText }}>
-              Workflow progress ({percent}%)
-            </Text>
-            <Tag color="blue">{status.toUpperCase()}</Tag>
-          </Space>
+      <Flex vertical gap={16} style={{ padding: 16, height: '100%', overflow: 'hidden' }}>
+        <Flex justify="space-between" align="center">
+          <Text strong style={{ fontSize: 14, letterSpacing: 0.5 }}>
+            WORKFLOW
+          </Text>
+          <Tag color={status === 'idle' ? 'default' : 'blue'}>{status.toUpperCase()}</Tag>
+        </Flex>
+        {activeStep && (
+          <Alert
+            message="Active Step"
+            description={`${activeStep.title} - ${STEP_STATUS_TEXT[activeStep.status] || activeStep.status}`}
+            type="info"
+            showIcon
+            style={{ borderRadius: 8 }}
+          />
+        )}
+        <Divider style={{ margin: '4px 0' }} />
+        <div style={{ flex: 1, overflowY: 'auto', paddingRight: 8 }}>
           <Steps
+            direction="vertical"
             size="small"
             items={planSteps.map((step) => ({
               title: step.title,
@@ -799,310 +939,366 @@ export default function Chat() {
               status: STEP_STATUS_MAP[step.status] || 'wait',
             }))}
           />
-          {activeStep && (
-            <Text type="secondary">
-              Active step: {activeStep.title} ·{' '}
-              {STEP_STATUS_TEXT[activeStep.status] || activeStep.status}
-            </Text>
-          )}
-        </Space>
-      </div>
+          <Divider />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Progress: {percent}% ({finishedSteps}/{planSteps.length})
+          </Text>
+        </div>
+      </Flex>
     )
   }, [planSteps, planState.activeStepId, status])
 
-  return (
-    <Card
-      style={{
-        background: THEME.cardBg,
-        borderRadius: 16,
-        border: `1px solid ${THEME.cardBorder}`,
-        boxShadow: '0 8px 24px rgba(15, 23, 42, 0.08)',
-      }}
-      styles={{ body: { padding: 16 } }}
-    >
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
-        <Space
-          align="center"
-          size="middle"
-          style={{ width: '100%', flexWrap: 'wrap' }}
-        >
-          <Input
-            prefix={<UserOutlined />}
-            value={userId}
-            onChange={(e) => setUserId(e.target.value)}
-            placeholder="User ID"
-            style={{
-              width: 240,
-              background: THEME.inputBg,
-              color: THEME.inputText,
-              border: `1px solid ${THEME.cardBorder}`,
+  const hero = (
+    <Flex vertical gap={16} align="center" justify="center" style={{ padding: '32px 0' }}>
+      <div
+        style={{
+          width: 64,
+          height: 64,
+          borderRadius: 18,
+          background: antdToken.colorPrimaryBg,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <MessageOutlined style={{ fontSize: 28, color: antdToken.colorPrimary }} />
+      </div>
+      <Flex vertical align="center" gap={8} style={{ textAlign: 'center' }}>
+        <Text style={{ fontSize: 28, fontWeight: 700, color: antdToken.colorText }}>
+          How can I help you today?
+        </Text>
+        <Text type="secondary">
+          I can execute complex plans, search the web, and help you solve problems with full transparency.
+        </Text>
+      </Flex>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+          gap: 12,
+          width: '100%',
+          maxWidth: 720,
+        }}
+      >
+        {heroPrompts.map((item) => (
+          <Card
+            key={item.title}
+            hoverable
+            onClick={() => {
+              setText(item.prompt)
+              startStream(item.prompt)
             }}
-          />
-          <Tooltip title="Refresh documents">
-            <Button
-              icon={<DatabaseOutlined />}
-              onClick={refreshDocuments}
-              loading={documentsLoading}
-            >
-              Refresh Docs
-            </Button>
-          </Tooltip>
-          <Tooltip title="Start a new session">
-            <Button icon={<ReloadOutlined />} onClick={resetSession}>
-              New Session
-            </Button>
-          </Tooltip>
-          <Checkbox
-            checked={rememberNext}
-            onChange={(e) => setRememberNext(e.target.checked)}
+            style={{ borderRadius: 14, boxShadow: antdToken.boxShadowTertiary }}
           >
-            Remember next answer
-          </Checkbox>
-        </Space>
+            <Flex align="center" justify="space-between">
+              <div>
+                <Text strong>{item.title}</Text>
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {item.desc}
+                  </Text>
+                </div>
+              </div>
+              <div style={{ fontSize: 18, color: antdToken.colorPrimary }}>{item.icon}</div>
+            </Flex>
+          </Card>
+        ))}
+      </div>
+    </Flex>
+  )
 
-        <Tabs
-          defaultActiveKey="chat"
-          items={[
-            {
-              key: 'chat',
-              label: 'Chat',
-              children: (
-                <Space direction="vertical" size="large" style={{ width: '100%' }}>
-                  {planBanner}
-                  <List
-                    dataSource={messages}
-                    rowKey={(item) => item.id}
-                    split={false}
-                    renderItem={(item) => (
-                      <List.Item style={{ padding: '12px 0' }}>
-                        {renderMessage(item)}
-                      </List.Item>
-                    )}
-                    style={{ maxHeight: 440, overflowY: 'auto' }}
-                  />
-                  <Space.Compact style={{ width: '100%' }}>
-                    <Input.TextArea
-                      autoSize={{ minRows: 1, maxRows: 4 }}
-                      placeholder="Ask something, e.g. 'Summarize my latest document'"
-                      value={text}
-                      onChange={(e) => setText(e.target.value)}
-                      onPressEnter={(e) => {
-                        if (!e.shiftKey) {
-                          e.preventDefault()
-                          startStream()
-                        }
-                      }}
-                      style={{
-                        background: THEME.inputBg,
-                        color: THEME.inputText,
-                        borderColor: THEME.cardBorder,
-                      }}
-                    />
-                    <Tooltip title="Send">
-                      <Button
-                        type="primary"
-                        icon={<SendOutlined />}
-                        onClick={startStream}
-                        loading={loading && !resumeLoading}
-                      >
-                        Send
-                      </Button>
-                    </Tooltip>
-                    <Tooltip title="Stop current request">
-                      <Button
-                        icon={<StopOutlined />}
-                        onClick={stopStream}
-                        disabled={!loading && !resumeLoading}
-                      >
-                        Stop
-                      </Button>
-                    </Tooltip>
-                  </Space.Compact>
-                </Space>
-              ),
-            },
-            {
-              key: 'documents',
-              label: 'Knowledge Base',
-              children: (
-                <Card
-                  size="small"
-                  title={
-                    <Space align="center">
-                      <CloudUploadOutlined />
-                      <span>Knowledge Upload</span>
-                    </Space>
+  return (
+    <Flex
+      style={{
+        background: '#f7f9fc',
+        height: 'calc(100vh - 120px)',
+        borderRadius: 18,
+        border: '1px solid ' + antdToken.colorBorder,
+        overflow: 'hidden',
+      }}
+    >
+      <div
+        style={{
+          width: 300,
+          background: '#f7f9fc',
+          color: '#0f172a',
+          borderRight: '1px solid #e5e7eb',
+          padding: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 14,
+          boxShadow: 'inset -1px 0 0 #e5e7eb',
+        }}
+      >
+        <Flex justify="space-between" align="center">
+          <Flex align="center" gap={10}>
+            <div
+              style={{
+                width: 32,
+                height: 32,
+                borderRadius: 10,
+                background: '#e7f0ff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <MessageOutlined style={{ color: '#2563eb' }} />
+            </div>
+            <div>
+              <Text strong style={{ fontSize: 16, color: '#0f172a' }}>
+                聊天记录
+              </Text>
+              <div>
+                <Text type="secondary" style={{ color: '#475569', fontSize: 12 }}>
+                  ChatGPT 风格侧边栏
+                </Text>
+              </div>
+            </div>
+          </Flex>
+          <Tooltip title="刷新会话列表">
+            <Button
+              icon={<ReloadOutlined />}
+              size="small"
+              type="text"
+              onClick={refreshThreads}
+              loading={threadsLoading}
+              style={{ color: '#475569' }}
+            />
+          </Tooltip>
+        </Flex>
+        <Button
+          icon={<PlusOutlined />}
+          block
+          onClick={() => startNewThread()}
+          loading={threadActionId === 'new'}
+          disabled={!userId}
+          style={{
+            background: '#2563eb',
+            border: '1px solid #1d4ed8',
+            color: '#ffffff',
+            fontWeight: 700,
+            height: 46,
+            borderRadius: 12,
+            boxShadow: '0 10px 30px rgba(37, 99, 235, 0.18)',
+          }}
+        >
+          新建对话
+        </Button>
+        <div
+          style={{
+            padding: 12,
+            borderRadius: 12,
+            background: '#ffffff',
+            border: '1px solid #e5e7eb',
+          }}
+        >
+          <Text style={{ color: '#0f172a', fontWeight: 600 }}>当前用户</Text>
+          <div style={{ marginTop: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Tag color="geekblue" style={{ border: 'none', background: '#e0e7ff', color: '#3730a3' }}>
+              {userId || '未设置'}
+            </Tag>
+            <Tag color="green" style={{ border: 'none', background: '#dcfce7', color: '#166534' }}>
+              {sessionId ? '已连接' : '待开始'}
+            </Tag>
+          </div>
+        </div>
+        <Text type="secondary" style={{ color: '#475569', fontSize: 12, letterSpacing: 1 }}>
+          RECENT
+        </Text>
+        <div style={{ flex: 1, overflowY: 'auto', marginRight: -6, paddingRight: 6 }}>
+          {threads.length === 0 ? (
+            <div
+              style={{
+                border: '1px dashed #e2e8f0',
+                borderRadius: 12,
+                padding: 14,
+                color: '#475569',
+                textAlign: 'center',
+              }}
+            >
+              <MessageOutlined style={{ fontSize: 18, color: '#94a3b8' }} /> 开始聊天以创建新的会话
+            </div>
+          ) : (
+            <List
+              dataSource={threads}
+              rowKey={(item) => item.thread_id}
+              renderItem={(item) => {
+                const isActive = item.thread_id === sessionId
+                const updatedText = item.updated_at ? new Date(item.updated_at * 1000).toLocaleString() : ''
+                return (
+                  <List.Item
+                    style={{
+                      cursor: 'pointer',
+                      background: 'transparent',
+                      borderRadius: 12,
+                      marginBottom: 10,
+                      border: isActive ? '1px solid #d0d7ff' : '1px solid #e5e7eb',
+                      padding: 12,
+                      transition: 'all 0.2s ease',
+                      color: '#0f172a',
+                    }}
+                    onClick={() => selectThread(item.thread_id)}
+                  >
+                    <Flex justify="space-between" align="flex-start" gap={8} style={{ width: '100%' }}>
+                      <Flex vertical gap={4} style={{ flex: 1 }}>
+                        <Text strong style={{ color: '#0f172a' }}>
+                          {item.title || 'Untitled chat'}
+                        </Text>
+                        <Text type="secondary" style={{ fontSize: 11, color: '#94a3b8' }}>
+                          {updatedText}
+                        </Text>
+                      </Flex>
+                      <Space size="small">
+                        <Tooltip title="重命名会话">
+                          <Button
+                            size="small"
+                            type="text"
+                            icon={<EditOutlined />}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleRenameThread(item)
+                            }}
+                            loading={threadActionId === item.thread_id}
+                            style={{ color: '#475569' }}
+                          />
+                        </Tooltip>
+                        <Tooltip title="删除会话">
+                          <Button
+                            size="small"
+                            type="text"
+                            danger
+                            icon={<DeleteOutlined />}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleDeleteThread(item.thread_id)
+                            }}
+                            loading={threadActionId === item.thread_id}
+                          />
+                        </Tooltip>
+                      </Space>
+                    </Flex>
+                  </List.Item>
+                )
+              }}
+            />
+          )}
+        </div>
+      </div>
+
+      <Flex vertical style={{ flex: 1, padding: 24, overflow: 'hidden', gap: 16 }}>
+        <Flex justify="space-between" align="center" wrap style={{ gap: 12 }}>
+          <div>
+            <Text strong style={{ fontSize: 18 }}>
+              {activeThread?.title || 'New chat'}
+            </Text>
+            <div>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Thread: {sessionId || 'pending'} - User: {userId || 'not set'}
+              </Text>
+            </div>
+          </div>
+          {statusBanner}
+        </Flex>
+
+        <div
+          ref={chatAreaRef}
+          style={{
+            flex: 1,
+            overflowY: 'auto',
+            padding: '0 8px',
+          }}
+        >
+          {messages.length === 0 ? (
+            hero
+          ) : (
+            <List
+              dataSource={messages}
+              rowKey={(item) => item.id}
+              split={false}
+              renderItem={(item) => (
+                <List.Item style={{ padding: '0', margin: 0 }}>
+                  {renderMessage(item)}
+                </List.Item>
+              )}
+            />
+          )}
+        </div>
+
+        <Card
+          style={{
+            borderRadius: 14,
+            boxShadow: antdToken.boxShadowTertiary,
+            border: '1px solid ' + antdToken.colorBorder,
+          }}
+          bodyStyle={{ padding: 12 }}
+        >
+          <Flex vertical gap="small">
+            <Flex gap="small" wrap align="center">
+              <Button size="small" type="text" onClick={() => exportJSON(messages)}>
+                JSON
+              </Button>
+              <Button size="small" type="text" onClick={() => exportMarkdown(messages)}>
+                MD
+              </Button>
+              <Button size="small" type="text" onClick={() => copySelectedOrLast(5)}>
+                Copy last 5
+              </Button>
+              <Checkbox checked={rememberNext} onChange={(e) => setRememberNext(e.target.checked)}>
+                Remember this turn
+              </Checkbox>
+            </Flex>
+            <Flex gap="small" align="flex-end">
+              <TextArea
+                autoSize={{ minRows: 2, maxRows: 4 }}
+                placeholder="Type your message..."
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                onPressEnter={(e) => {
+                  if (!e.shiftKey) {
+                    e.preventDefault()
+                    startStream()
                   }
-                  style={{
-                    background: THEME.cardBg,
-                    border: `1px solid ${THEME.cardBorder}`,
-                  }}
-                >
-                  <Space direction="vertical" size="large" style={{ width: '100%' }}>
-                    <Dragger {...uploadProps} disabled={!userId}>
-                      <p className="ant-upload-drag-icon">
-                        <InboxOutlined />
-                      </p>
-                      <p className="ant-upload-text">
-                        Click or drag a document to upload for retrieval
-                      </p>
-                      <p className="ant-upload-hint">
-                        Documents are chunked, embedded, and scoped to your user ID.
-                      </p>
-                    </Dragger>
+                }}
+                style={{ flex: 1, borderRadius: 10 }}
+                disabled={loading}
+              />
+              <Tooltip title="Send">
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  onClick={startStream}
+                  loading={loading && !resumeLoading}
+                  disabled={!text.trim() || !userId?.trim() || loading}
+                  style={{ height: '100%' }}
+                />
+              </Tooltip>
+              <Tooltip title="Stop current request">
+                <Button
+                  icon={<StopOutlined />}
+                  onClick={stopStream}
+                  disabled={!loading && !resumeLoading}
+                  danger
+                  style={{ height: '100%' }}
+                />
+              </Tooltip>
+            </Flex>
+          </Flex>
+        </Card>
+      </Flex>
 
-                    <Divider style={{ margin: '12px 0' }} />
-
-                    <Space direction="vertical" style={{ width: '100%' }}>
-                      <Text style={{ color: THEME.inputText }}>Uploaded documents</Text>
-                      {documents.length === 0 ? (
-                        <Empty
-                          image={Empty.PRESENTED_IMAGE_SIMPLE}
-                          description="No documents yet"
-                        />
-                      ) : (
-                        <List
-                          dataSource={documents}
-                          rowKey={(item) => item.id}
-                          renderItem={(item) => (
-                            <List.Item
-                              style={{
-                                background: THEME.panelBg,
-                                borderRadius: 8,
-                                marginBottom: 8,
-                                border: `1px solid ${THEME.cardBorder}`,
-                              }}
-                            >
-                              <Space
-                                direction="vertical"
-                                size={4}
-                                style={{ width: '100%' }}
-                              >
-                                <Space align="center">
-                                  <Tag color="blue">{item.filename}</Tag>
-                                  <Tag color="purple">
-                                    {item.status?.toUpperCase()}
-                                  </Tag>
-                                  {item.error && (
-                                    <Tag color="red">error: {item.error}</Tag>
-                                  )}
-                                </Space>
-                                <Space
-                                  align="center"
-                                  style={{ justifyContent: 'space-between' }}
-                                >
-                                  <Text type="secondary">
-                                    {new Date(item.updated_at * 1000 || Date.now()).toLocaleString()}
-                                  </Text>
-                                  {item.status === 'processing' && (
-                                    <Progress
-                                      percent={40}
-                                      size="small"
-                                      showInfo={false}
-                                    />
-                                  )}
-                                </Space>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      )}
-                    </Space>
-                  </Space>
-                </Card>
-              ),
-            },
-            {
-              key: 'ops',
-              label: 'Ops Console',
-              children: (
-                <Card
-                  size="small"
-                  style={{
-                    background: THEME.cardBg,
-                    border: `1px solid ${THEME.cardBorder}`,
-                  }}
-                  title="Tool Budget Controls"
-                >
-                  <Space direction="vertical" size="large" style={{ width: '100%' }}>
-                    <Alert
-                      type="info"
-                      showIcon
-                      message="Guardrail budget"
-                      description="Tune max tool calls, concurrency, and latency budget without redeploying. Metrics are exported for Grafana/Prometheus via /metrics."
-                    />
-                    <Form
-                      layout="vertical"
-                      requiredMark={false}
-                      style={{
-                        background: THEME.panelBg,
-                        padding: 16,
-                        borderRadius: 12,
-                        border: `1px solid ${THEME.cardBorder}`,
-                      }}
-                    >
-                      <Form.Item label="Max tool calls per request">
-                        <InputNumber
-                          min={1}
-                          max={32}
-                          value={toolBudgetDraft.max_tasks}
-                          onChange={(value) => handleBudgetFieldChange('max_tasks', value)}
-                          disabled={toolBudgetLoading}
-                        />
-                      </Form.Item>
-                      <Form.Item label="Max parallel (non-exclusive) tools">
-                        <InputNumber
-                          min={1}
-                          max={10}
-                          value={toolBudgetDraft.max_parallel}
-                          onChange={(value) => handleBudgetFieldChange('max_parallel', value)}
-                          disabled={toolBudgetLoading}
-                        />
-                      </Form.Item>
-                      <Form.Item label="Total latency budget (seconds)">
-                        <InputNumber
-                          min={1}
-                          max={120}
-                          step={0.5}
-                          value={toolBudgetDraft.total_latency}
-                          onChange={(value) => handleBudgetFieldChange('total_latency', value)}
-                          disabled={toolBudgetLoading}
-                        />
-                      </Form.Item>
-                    </Form>
-                    <Space wrap>
-                      <Button
-                        type="primary"
-                        icon={<SaveOutlined />}
-                        onClick={handleBudgetSave}
-                        disabled={!budgetChanged || toolBudgetLoading}
-                        loading={toolBudgetSaving}
-                      >
-                        Apply changes
-                      </Button>
-                      <Button onClick={handleBudgetReset} disabled={!toolBudget || toolBudgetLoading}>
-                        Reset form
-                      </Button>
-                      <Button icon={<ReloadOutlined />} onClick={refreshToolBudget} loading={toolBudgetLoading}>
-                        Refresh from server
-                      </Button>
-                      <Button icon={<LineChartOutlined />} onClick={openMetricsFeed}>
-                        Open metrics feed
-                      </Button>
-                    </Space>
-                    <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                      Metrics endpoint:{' '}
-                      <code style={{ color: '#f472b6' }}>{`${API_BASE}/metrics`}</code>. Grafana can scrape this
-                      Prometheus feed to alert when <code>tool_throttle_events_total</code> spikes.
-                    </Paragraph>
-                  </Space>
-                </Card>
-              ),
-            },
-          ]}
-        />
-      </Space>
-
+      <div
+        style={{
+          width: 320,
+          background: '#f7f9fc',
+          borderLeft: '1px solid ' + antdToken.colorBorder,
+          padding: 12,
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        {planSidebar}
+      </div>
       <Modal
         open={interruptVisible}
         title="Execution paused"
@@ -1111,12 +1307,7 @@ export default function Chat() {
           setInterruptInfo(null)
         }}
         footer={[
-          <Button
-            key="cancel"
-            icon={<StopOutlined />}
-            onClick={() => resume('cancel')}
-            loading={resumeLoading}
-          >
+          <Button key="cancel" icon={<StopOutlined />} onClick={() => resume('cancel')} loading={resumeLoading}>
             Cancel
           </Button>,
           <Button
@@ -1131,20 +1322,19 @@ export default function Chat() {
         ]}
         centered
       >
-        <Space direction="vertical" size={12} style={{ width: '100%' }}>
-          <Text>
-            {interruptInfo?.message ||
-              'The workflow requires confirmation. Continue?'}
-          </Text>
+        <Flex vertical gap={12} style={{ width: '100%' }}>
+          <Text>{interruptInfo?.message || 'The workflow requires confirmation. Continue?'}</Text>
           {interruptInfo?.options && (
-            <Space>
+            <Flex wrap gap="small">
               {interruptInfo.options.map((option) => (
-                <Tag key={option}>{option}</Tag>
+                <Tag key={option} color="blue">
+                  {option}
+                </Tag>
               ))}
-            </Space>
+            </Flex>
           )}
-        </Space>
+        </Flex>
       </Modal>
-    </Card>
+    </Flex>
   )
 }
