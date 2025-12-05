@@ -51,6 +51,25 @@ export default function App() {
   const [authMode, setAuthMode] = useState('login')
   const [form] = Form.useForm()
   const [userId, setUserId] = usePersistentUserId()
+  const [tenantId, setTenantId] = useState(() => {
+    try {
+      return window.localStorage.getItem('lg-tenant-id') || 'tenant-demo'
+    } catch (err) {
+      return 'tenant-demo'
+    }
+  })
+
+  useEffect(() => {
+    try {
+      if (tenantId) {
+        window.localStorage.setItem('lg-tenant-id', tenantId)
+      } else {
+        window.localStorage.removeItem('lg-tenant-id')
+      }
+    } catch (err) {
+      console.warn('persist tenant failed', err)
+    }
+  }, [tenantId])
 
   const persistToken = useCallback(
     (value) => {
@@ -150,6 +169,13 @@ export default function App() {
           {token ? (
             <Space>
               <Tag color="gold">{userId ? `当前用户：${userId}` : '已登录'}</Tag>
+              <Input
+                size="small"
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                placeholder="tenant id"
+                style={{ width: 180, background: '#fff' }}
+              />
               <Button danger size="small" onClick={handleLogout}>
                 退出登录
               </Button>
@@ -175,17 +201,17 @@ export default function App() {
                 {
                   key: 'chat',
                   label: '聊天',
-                  children: <Chat token={token} userId={userId} setUserId={setUserId} />,
+                  children: <Chat token={token} userId={userId} setUserId={setUserId} tenantId={tenantId} />,
                 },
                 {
                   key: 'documents',
                   label: '知识库',
-                  children: <KnowledgePanel userId={userId} apiToken={token} />,
+                  children: <KnowledgePanel userId={userId} apiToken={token} tenantId={tenantId} />,
                 },
                 {
                   key: 'ops',
                   label: '运维',
-                  children: <OpsPanel apiToken={token} />,
+                  children: <OpsPanel apiToken={token} userId={userId} tenantId={tenantId} />,
                 },
               ]}
             />

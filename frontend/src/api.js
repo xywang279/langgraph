@@ -7,6 +7,14 @@ export const buildAuthHeaders = (token) => {
   return key ? { Authorization: `Bearer ${key}` } : {};
 };
 
+export const withAuthParams = (params = {}, token) => {
+  const search = new URLSearchParams(params);
+  if (token || API_KEY) {
+    search.set('api_key', token || API_KEY);
+  }
+  return search.toString();
+};
+
 export async function login(username, password) {
   const resp = await fetch(`${API_BASE}/auth/login`, {
     method: 'POST',
@@ -111,5 +119,76 @@ export async function updateToolBudgetConfig(payload, token) {
   if (!resp.ok) {
     throw new Error(`Failed to update tool budget: ${resp.status}`);
   }
+  return resp.json();
+}
+
+export async function fetchDocumentVersions(documentId, userId, tenantId, token) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId }, token);
+  const resp = await fetch(`${API_BASE}/documents/${documentId}/versions?${qs}`, {
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to load versions: ${resp.status}`);
+  return resp.json();
+}
+
+export async function publishDocumentVersion(documentId, versionId, userId, tenantId, token) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId }, token);
+  const resp = await fetch(`${API_BASE}/documents/${documentId}/versions/${versionId}/publish?${qs}`, {
+    method: 'POST',
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to publish version: ${resp.status}`);
+  return resp.json();
+}
+
+export async function rollbackDocumentVersion(documentId, versionId, userId, tenantId, token) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId }, token);
+  const resp = await fetch(`${API_BASE}/documents/${documentId}/versions/${versionId}/rollback?${qs}`, {
+    method: 'POST',
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to rollback version: ${resp.status}`);
+  return resp.json();
+}
+
+export async function fetchIngestionJobs(userId, tenantId, token, limit = 50) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId, limit: String(limit) }, token);
+  const resp = await fetch(`${API_BASE}/ingestion_jobs?${qs}`, {
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to load ingestion jobs: ${resp.status}`);
+  return resp.json();
+}
+
+export async function fetchIngestionJob(jobId, userId, tenantId, token) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId }, token);
+  const resp = await fetch(`${API_BASE}/ingestion_jobs/${jobId}?${qs}`, {
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to load ingestion job: ${resp.status}`);
+  return resp.json();
+}
+
+export async function fetchVectorHealth(userId, tenantId, token) {
+  const qs = withAuthParams({ user_id: userId, tenant_id: tenantId }, token);
+  const resp = await fetch(`${API_BASE}/ops/vector/health?${qs}`, {
+    headers: { ...buildAuthHeaders(token) },
+  });
+  if (!resp.ok) throw new Error(`Failed to load vector health: ${resp.status}`);
+  return resp.json();
+}
+
+export async function uploadNewVersion(documentId, file, userId, tenantId, token) {
+  const form = new FormData();
+  form.append('user_id', userId);
+  form.append('tenant_id', tenantId || '');
+  form.append('file', file);
+  const qs = withAuthParams({}, token);
+  const resp = await fetch(`${API_BASE}/documents/${documentId}/versions/upload?${qs}`, {
+    method: 'POST',
+    headers: { ...buildAuthHeaders(token) },
+    body: form,
+  });
+  if (!resp.ok) throw new Error(`Failed to upload new version: ${resp.status}`);
   return resp.json();
 }

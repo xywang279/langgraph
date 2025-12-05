@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Card, Flex, Alert, Form, InputNumber, Button, Typography, message as antdMessage, theme as antdTheme } from 'antd'
+import { Card, Flex, Alert, Form, InputNumber, Button, Typography, message as antdMessage, theme as antdTheme, Table, Tag } from 'antd'
 import { SaveOutlined, ReloadOutlined, LineChartOutlined } from '@ant-design/icons'
-import { API_BASE, API_KEY, fetchToolBudgetConfig, updateToolBudgetConfig } from '../api'
+import { API_BASE, API_KEY, fetchToolBudgetConfig, updateToolBudgetConfig, fetchIngestionJobs, fetchVectorHealth } from '../api'
 
 const { Paragraph } = Typography
 
-export default function OpsPanel({ apiToken }) {
+export default function OpsPanel({ apiToken, userId, tenantId }) {
   const { token: antdToken } = antdTheme.useToken()
   const resolvedToken = useMemo(() => apiToken || API_KEY || '', [apiToken])
 
@@ -17,6 +17,10 @@ export default function OpsPanel({ apiToken }) {
   })
   const [toolBudgetLoading, setToolBudgetLoading] = useState(false)
   const [toolBudgetSaving, setToolBudgetSaving] = useState(false)
+  const [jobs, setJobs] = useState([])
+  const [jobsLoading, setJobsLoading] = useState(false)
+  const [health, setHealth] = useState([])
+  const [healthLoading, setHealthLoading] = useState(false)
 
   const refreshToolBudget = useCallback(async () => {
     setToolBudgetLoading(true)
@@ -35,6 +39,37 @@ export default function OpsPanel({ apiToken }) {
   useEffect(() => {
     refreshToolBudget()
   }, [refreshToolBudget])
+
+  const refreshJobs = useCallback(async () => {
+    if (!userId || !tenantId) return
+    setJobsLoading(true)
+    try {
+      const data = await fetchIngestionJobs(userId, tenantId, resolvedToken, 50)
+      setJobs(Array.isArray(data.items) ? data.items : [])
+    } catch (err) {
+      antdMessage.error(err?.message || 'Failed to load ingestion jobs')
+    } finally {
+      setJobsLoading(false)
+    }
+  }, [userId, tenantId, resolvedToken])
+
+  const refreshHealth = useCallback(async () => {
+    if (!userId || !tenantId) return
+    setHealthLoading(true)
+    try {
+      const data = await fetchVectorHealth(userId, tenantId, resolvedToken)
+      setHealth(Array.isArray(data.items) ? data.items : [])
+    } catch (err) {
+      antdMessage.error(err?.message || 'Failed to load vector health')
+    } finally {
+      setHealthLoading(false)
+    }
+  }, [userId, tenantId, resolvedToken])
+
+  useEffect(() => {
+    refreshJobs()
+    refreshHealth()
+  }, [refreshJobs, refreshHealth])
 
   const handleBudgetFieldChange = useCallback((field, value) => {
     setToolBudgetDraft((prev) => ({
@@ -173,6 +208,70 @@ export default function OpsPanel({ apiToken }) {
         <Paragraph type="secondary" style={{ marginBottom: 0 }}>
           Metrics endpoint: <code style={{ color: '#f472b6' }}>{`${API_BASE}/metrics`}</code>.
         </Paragraph>
+
+        <Card
+          title="Ingestion Jobs"
+          size="small"
+          extra={
+            <Button size="small" icon={<ReloadOutlined />} onClick={refreshJobs} loading={jobsLoading}>
+              刷新
+            </Button>
+          }
+        >
+          <Table
+            size="small"
+            loading={jobsLoading}
+            dataSource={jobs}
+            rowKey={(row) => row.id}
+            pagination={false}
+            columns={[
+              { title: 'Job ID', dataIndex: 'id', ellipsis: true },
+              { title: 'Source', dataIndex: 'source' },
+              {
+                title: 'Progress',
+                render: (_, row) => `${row.processed ?? 0}/${row.total ?? 0}`,
+              },
+              {
+                title: 'Status',
+                dataIndex: 'status',
+                render: (v) => <Tag color={v === 'failed' ? 'red' : v === 'completed' ? 'green' : 'blue'}>{(v || '').toUpperCase()}</Tag>,
+              },
+              { title: 'Updated', dataIndex: 'updated_at', render: (t) => (t ? new Date(t * 1000).toLocaleString() : '--') },
+            ]}
+            locale={{ emptyText: 'No jobs' }}
+          />
+        </Card>
+
+        <Card
+          title="Vector Health"
+          size="small"
+          extra={
+            <Button size="small" icon={<ReloadOutlined />} onClick={refreshHealth} loading={healthLoading}>
+              刷新
+            </Button>
+          }
+        >
+          <Table
+            size="small"
+            loading={healthLoading}
+            dataSource={health}
+            rowKey={(row) => row.document_id + (row.version_id || '')}
+            pagination={false}
+            columns={[
+              { title: 'Doc ID', dataIndex: 'document_id', ellipsis: true },
+              { title: 'Version', dataIndex: 'version_id', ellipsis: true },
+              { title: 'Expected', dataIndex: 'expected_vectors' },
+              { title: 'Stored', dataIndex: 'stored_vectors' },
+              {
+                title: 'Health',
+                dataIndex: 'health_status',
+                render: (v) => <Tag color={v === 'healthy' ? 'green' : v === 'degraded' ? 'orange' : 'gray'}>{v || 'unknown'}</Tag>,
+              },
+              { title: 'Notes', dataIndex: 'notes', ellipsis: true },
+            ]}
+            locale={{ emptyText: 'No health data' }}
+          />
+        </Card>
       </Flex>
     </Card>
   )

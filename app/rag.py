@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pdfplumber
 import pytesseract
+from PIL import Image
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -44,8 +45,10 @@ class UserVectorStoreRetriever(BaseRetriever):
     """LangChain 1.0 compatible retriever bound to a user's FAISS index."""
 
     user_id: str
+    tenant_id: Optional[str] = None
     top_k: int = 5
     min_score: float = 0.2
+    published_only: bool = True
 
     def _get_relevant_documents(
         self,
@@ -62,9 +65,11 @@ class UserVectorStoreRetriever(BaseRetriever):
         if store is None:
             return _legacy_similarity_scan(
                 user_id=self.user_id,
+                tenant_id=self.tenant_id,
                 query=normalized,
                 top_k=self.top_k,
                 min_score=self.min_score,
+                published_only=self.published_only,
             )
 
         documents: List[Document] = []
@@ -143,6 +148,26 @@ def _load_vector_store(user_id: str) -> Optional[FAISS]:
         return None
 
 
+def user_index_size(user_id: str) -> int:
+    store = _load_vector_store(user_id)
+    if store is None:
+        return 0
+    try:
+        return int(getattr(store, "index", None).ntotal)
+    except Exception:
+        return 0
+
+
+def index_ids_for_user(user_id: str) -> List[str]:
+    store = _load_vector_store(user_id)
+    if store is None:
+        return []
+    try:
+        return [metadata.get("document_id", "") for metadata in store.docstore._dict.values()]  # type: ignore
+    except Exception:
+        return []
+
+
 def _persist_vector_store(user_id: str, store: FAISS) -> None:
     target = _vector_store_dir(user_id)
     store.save_local(str(target))
@@ -167,8 +192,8 @@ def _append_to_vector_index(user_id: str, documents: List[Document]) -> None:
     _persist_vector_store(user_id, store)
 
 
-def _rebuild_vector_index(user_id: str) -> None:
-    chunks = list(storage.iter_user_chunks(user_id))
+def _rebuild_vector_index(user_id: str, tenant_id: Optional[str] = None) -> None:
+    chunks = list(storage.iter_published_chunks(user_id, tenant_id))
     if not chunks:
         _delete_vector_store(user_id)
         return
@@ -212,7 +237,7 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _legacy_similarity_scan(
-    *, user_id: str, query: str, top_k: int, min_score: float
+    *, user_id: str, tenant_id: Optional[str], query: str, top_k: int, min_score: float, published_only: bool
 ) -> List[Document]:
     embeddings = _embed_texts([query])
     if not embeddings:
@@ -220,7 +245,8 @@ def _legacy_similarity_scan(
     query_vector = embeddings[0]
 
     scored: List[Tuple[float, Document]] = []
-    for chunk in storage.iter_user_chunks(user_id):
+    chunks_iter = storage.iter_published_chunks(user_id, tenant_id) if published_only else storage.iter_user_chunks(user_id, tenant_id)
+    for chunk in chunks_iter:
         score = _cosine_similarity(query_vector, chunk["embedding"])
         if score < min_score:
             continue
@@ -246,6 +272,10 @@ def process_document_file(
     document_id: str,
     user_id: str,
     file_path: Path,
+    version_id: Optional[str] = None,
+    publish: bool = True,
+    embedding_model: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> None:
     _ensure_user(user_id)
     logger.info(
@@ -260,10 +290,17 @@ def process_document_file(
         storage.update_document_status(
             document_id, status="empty", error="Document contains no readable content."
         )
+        if version_id:
+            storage.update_document_version(
+                version_id,
+                status="empty",
+                error="Document contains no readable content.",
+            )
         logger.warning("document empty doc_id=%s user=%s", document_id, user_id)
         return
 
     embeddings = _embed_texts(chunks)
+    used_model = embedding_model or EMBED_MODEL
     chunk_payloads: List[Dict[str, Any]] = []
     documents: List[Document] = []
     for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
@@ -273,10 +310,12 @@ def process_document_file(
             "chunk_index": idx,
             "document_id": document_id,
             "chunk_id": chunk_id,
+            "version_id": version_id,
         }
         chunk_payloads.append(
             {
                 "id": chunk_id,
+                "version_id": version_id,
                 "chunk_index": idx,
                 "content": chunk_text,
                 "embedding": embedding,
@@ -285,10 +324,32 @@ def process_document_file(
         )
         documents.append(Document(page_content=chunk_text, metadata=metadata))
 
-    storage.delete_chunks_for_document(document_id)
-    storage.store_chunks(document_id=document_id, user_id=user_id, chunks=chunk_payloads)
-    storage.update_document_status(document_id, status="ready")
-    _rebuild_vector_index(user_id)
+    if version_id:
+        storage.delete_chunks_for_version(version_id)
+    else:
+        storage.delete_chunks_for_document(document_id)
+    storage.store_chunks(document_id=document_id, user_id=user_id, tenant_id=tenant_id, chunks=chunk_payloads)
+    storage.update_document_status(document_id, status="ready", error=None, path=str(file_path))
+    if version_id:
+        storage.update_document_version(
+            version_id,
+            status="ready",
+            path_raw=str(file_path),
+            chunk_count=len(chunk_payloads),
+            embedding_model=used_model,
+        )
+        if publish:
+            storage.publish_document_version(document_id, version_id)
+        storage.upsert_vector_stats(
+            tenant_id=tenant_id,
+            document_id=document_id,
+            version_id=version_id,
+            expected_vectors=len(chunk_payloads),
+            stored_vectors=len(chunk_payloads),
+            health_status="healthy",
+            notes=None,
+        )
+    _rebuild_vector_index(user_id, tenant_id)
     logger.info(
         "document processed doc_id=%s user=%s chunks=%s", document_id, user_id, len(documents)
     )
@@ -307,7 +368,7 @@ def store_memory_snippet(
     embeddings = _embed_texts([cleaned])
     if not embeddings:
         return None
-    document_id = storage.ensure_memory_document(user_id)
+    document_id = storage.ensure_memory_document(user_id, tenant_id=None)
     chunk_id = uuid.uuid4().hex
     chunk_metadata = {"source": "memory", **(metadata or {})}
     chunk_metadata.update({"document_id": document_id, "chunk_id": chunk_id})
@@ -321,6 +382,7 @@ def store_memory_snippet(
     storage.store_chunks(
         document_id=document_id,
         user_id=user_id,
+        tenant_id=None,
         chunks=[payload],
     )
     _append_to_vector_index(
@@ -332,6 +394,10 @@ def store_memory_snippet(
 
 def _extract_text(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}:
+        return _ocr_image(file_path)
+    if suffix in {".wav", ".mp3", ".m4a", ".flac", ".ogg"}:
+        raise RuntimeError("Audio transcription is not enabled in this build.")
     if suffix == ".pdf":
         try:
             with pdfplumber.open(file_path) as pdf:
@@ -374,14 +440,35 @@ def _ocr_pdf(file_path: Path) -> str:
         return ""
 
 
+def _ocr_image(file_path: Path) -> str:
+    if not _OCR_AVAILABLE:
+        logger.warning("tesseract not available; skipping OCR path=%s", file_path)
+        return ""
+    try:
+        with Image.open(file_path) as img:
+            text = pytesseract.image_to_string(img.convert("RGB"))
+            return text or ""
+    except Exception as exc:
+        logger.warning("image ocr failed path=%s err=%s", file_path, exc)
+        return ""
+
+
 def retrieve(
     *,
     user_id: str,
+    tenant_id: Optional[str] = None,
     query: str,
     top_k: int = 5,
     min_score: float = 0.2,
+    published_only: bool = True,
 ) -> List[Dict[str, Any]]:
-    retriever = UserVectorStoreRetriever(user_id=user_id, top_k=top_k, min_score=min_score)
+    retriever = UserVectorStoreRetriever(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        top_k=top_k,
+        min_score=min_score,
+        published_only=published_only,
+    )
     documents = retriever.invoke(query)
 
     results: List[Dict[str, Any]] = []

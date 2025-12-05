@@ -50,6 +50,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
+                tenant_id TEXT,
                 user_id TEXT NOT NULL,
                 filename TEXT NOT NULL,
                 path TEXT,
@@ -69,6 +70,8 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS chunks (
                 id TEXT PRIMARY KEY,
+                version_id TEXT,
+                tenant_id TEXT,
                 document_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
@@ -76,7 +79,8 @@ def init_db() -> None:
                 embedding TEXT NOT NULL,
                 metadata TEXT,
                 created_at REAL NOT NULL,
-                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                FOREIGN KEY(version_id) REFERENCES document_versions(id) ON DELETE SET NULL
             )
             """
         )
@@ -123,9 +127,23 @@ def init_db() -> None:
             ("size_bytes", "ALTER TABLE documents ADD COLUMN size_bytes REAL"),
             ("mime_type", "ALTER TABLE documents ADD COLUMN mime_type TEXT"),
             ("content_type", "ALTER TABLE documents ADD COLUMN content_type TEXT"),
+            ("latest_version_id", "ALTER TABLE documents ADD COLUMN latest_version_id TEXT"),
+            ("tenant_id", "ALTER TABLE documents ADD COLUMN tenant_id TEXT"),
         ]:
             if not _column_exists("documents", column):
                 conn.execute(ddl)
+        if not _column_exists("chunks", "version_id"):
+            conn.execute("ALTER TABLE chunks ADD COLUMN version_id TEXT")
+        if not _column_exists("chunks", "tenant_id"):
+            conn.execute("ALTER TABLE chunks ADD COLUMN tenant_id TEXT")
+        if _column_exists("chunks", "version_id"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_version ON chunks(version_id)"
+            )
+        if _column_exists("chunks", "tenant_id"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id)"
+            )
 
         for column, ddl in [
             ("password_hash", "ALTER TABLE users ADD COLUMN password_hash TEXT"),
@@ -135,6 +153,99 @@ def init_db() -> None:
         ]:
             if not _column_exists("users", column):
                 conn.execute(ddl)
+
+        if not _column_exists("vector_stats", "tenant_id"):
+            conn.execute("ALTER TABLE vector_stats ADD COLUMN tenant_id TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_versions (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                parent_version_id TEXT,
+                version_no INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                path_raw TEXT,
+                path_text TEXT,
+                text_hash TEXT,
+                chunk_count INTEGER,
+                embedding_model TEXT,
+                published INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                FOREIGN KEY(parent_version_id) REFERENCES document_versions(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_versions_doc ON document_versions(document_id, version_no DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_versions_published ON document_versions(document_id, published)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT,
+                user_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                params_json TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                total INTEGER DEFAULT 0,
+                processed INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_user ON ingestion_jobs(user_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_status ON ingestion_jobs(status)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingestion_tasks (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                document_id TEXT,
+                version_id TEXT,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                attempts INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES ingestion_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE SET NULL,
+                FOREIGN KEY(version_id) REFERENCES document_versions(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_job ON ingestion_tasks(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_status ON ingestion_tasks(status)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vector_stats (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT,
+                document_id TEXT,
+                version_id TEXT,
+                expected_vectors INTEGER,
+                stored_vectors INTEGER,
+                last_checked_at REAL,
+                health_status TEXT,
+                notes TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE SET NULL,
+                FOREIGN KEY(version_id) REFERENCES document_versions(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vector_stats_doc ON vector_stats(document_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vector_stats_health ON vector_stats(health_status)")
 
         conn.commit()
 
@@ -255,6 +366,7 @@ def update_user_summary(user_id: str, summary: str) -> None:
 def create_document(
     *,
     document_id: str,
+    tenant_id: Optional[str],
     user_id: str,
     filename: str,
     path: Optional[str],
@@ -263,7 +375,7 @@ def create_document(
     size_bytes: Optional[float] = None,
     mime_type: Optional[str] = None,
     content_type: Optional[str] = None,
-) -> None:
+) -> str:
     conn = _get_connection()
     now = time.time()
     with _LOCK:
@@ -271,6 +383,7 @@ def create_document(
             """
             INSERT INTO documents (
                 id,
+                tenant_id,
                 user_id,
                 filename,
                 path,
@@ -282,10 +395,11 @@ def create_document(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
+                tenant_id,
                 user_id,
                 filename,
                 path,
@@ -298,7 +412,40 @@ def create_document(
                 now,
             ),
         )
+        # create initial version placeholder for future ingestion pipeline
+        version_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO document_versions (
+                id,
+                document_id,
+                parent_version_id,
+                version_no,
+                status,
+                path_raw,
+                path_text,
+                created_at,
+                updated_at,
+                published
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0)
+            """,
+            (
+                version_id,
+                document_id,
+                None,
+                1,
+                status,
+                path,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE documents SET latest_version_id = ? WHERE id = ?",
+            (version_id, document_id),
+        )
         conn.commit()
+    return version_id
 
 
 def update_document_status(
@@ -332,6 +479,7 @@ def get_document(document_id: str) -> Optional[Dict[str, Any]]:
             """
             SELECT
                 id,
+                tenant_id,
                 user_id,
                 filename,
                 path,
@@ -341,6 +489,7 @@ def get_document(document_id: str) -> Optional[Dict[str, Any]]:
                 size_bytes,
                 mime_type,
                 content_type,
+                latest_version_id,
                 created_at,
                 updated_at,
                 (
@@ -361,13 +510,19 @@ def get_document(document_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_documents(user_id: str) -> List[Dict[str, Any]]:
+def list_documents(user_id: str, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
     conn = _get_connection()
+    params: List[Any] = [user_id]
+    tenant_clause = ""
+    if tenant_id is not None:
+        tenant_clause = "AND (d.tenant_id = ? OR d.tenant_id IS NULL)"
+        params.append(tenant_id)
     with _LOCK:
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 d.id,
+                d.tenant_id,
                 d.user_id,
                 d.filename,
                 d.path,
@@ -377,6 +532,7 @@ def list_documents(user_id: str) -> List[Dict[str, Any]]:
                 d.size_bytes,
                 d.mime_type,
                 d.content_type,
+                d.latest_version_id,
                 d.created_at,
                 d.updated_at,
                 (
@@ -391,11 +547,250 @@ def list_documents(user_id: str) -> List[Dict[str, Any]]:
                 ) AS embedding_count
             FROM documents d
             WHERE d.user_id = ?
+            {tenant_clause}
             ORDER BY d.created_at DESC
             """,
-            (user_id,),
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _next_version_no(document_id: str) -> int:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version_no), 0) AS max_no FROM document_versions WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    return int(row["max_no"] or 0) + 1
+
+
+def create_document_version(
+    document_id: str,
+    *,
+    parent_version_id: Optional[str] = None,
+    status: str = "pending",
+    path_raw: Optional[str] = None,
+    path_text: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    published: bool = False,
+) -> str:
+    version_id = uuid.uuid4().hex
+    version_no = _next_version_no(document_id)
+    now = time.time()
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            """
+            INSERT INTO document_versions (
+                id,
+                document_id,
+                parent_version_id,
+                version_no,
+                status,
+                path_raw,
+                path_text,
+                embedding_model,
+                published,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_id,
+                document_id,
+                parent_version_id,
+                version_no,
+                status,
+                path_raw,
+                path_text,
+                embedding_model,
+                1 if published else 0,
+                now,
+                now,
+            ),
+        )
+        if published:
+            conn.execute(
+                "UPDATE documents SET latest_version_id = ? WHERE id = ?",
+                (version_id, document_id),
+            )
+        conn.commit()
+    return version_id
+
+
+def update_document_version(
+    version_id: str,
+    *,
+    status: Optional[str] = None,
+    error: Optional[str] = None,
+    path_raw: Optional[str] = None,
+    path_text: Optional[str] = None,
+    chunk_count: Optional[int] = None,
+    embedding_model: Optional[str] = None,
+    published: Optional[bool] = None,
+) -> None:
+    fields = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if error is not None:
+        fields.append("error = ?")
+        params.append(error)
+    if path_raw is not None:
+        fields.append("path_raw = ?")
+        params.append(path_raw)
+    if path_text is not None:
+        fields.append("path_text = ?")
+        params.append(path_text)
+    if chunk_count is not None:
+        fields.append("chunk_count = ?")
+        params.append(chunk_count)
+    if embedding_model is not None:
+        fields.append("embedding_model = ?")
+        params.append(embedding_model)
+    if published is not None:
+        fields.append("published = ?")
+        params.append(1 if published else 0)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(time.time())
+    params.append(version_id)
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            f"UPDATE document_versions SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+
+
+def publish_document_version(document_id: str, version_id: str) -> None:
+    conn = _get_connection()
+    now = time.time()
+    with _LOCK:
+        conn.execute(
+            "UPDATE document_versions SET published = 0 WHERE document_id = ?",
+            (document_id,),
+        )
+        conn.execute(
+            """
+            UPDATE document_versions
+            SET published = 1, updated_at = ?
+            WHERE id = ? AND document_id = ?
+            """,
+            (now, version_id, document_id),
+        )
+        conn.execute(
+            "UPDATE documents SET latest_version_id = ? WHERE id = ?",
+            (version_id, document_id),
+        )
+        conn.commit()
+
+
+def get_latest_version_id(document_id: str) -> Optional[str]:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            "SELECT latest_version_id FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return row["latest_version_id"]
+
+
+def get_document_versions(document_id: str) -> List[Dict[str, Any]]:
+    conn = _get_connection()
+    with _LOCK:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                document_id,
+                parent_version_id,
+                version_no,
+                status,
+                error,
+                path_raw,
+                path_text,
+                text_hash,
+                chunk_count,
+                embedding_model,
+                published,
+                created_at,
+                updated_at
+            FROM document_versions
+            WHERE document_id = ?
+            ORDER BY version_no DESC
+            """,
+            (document_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_document_version(version_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                document_id,
+                parent_version_id,
+                version_no,
+                status,
+                error,
+                path_raw,
+                path_text,
+                text_hash,
+                chunk_count,
+                embedding_model,
+                published,
+                created_at,
+                updated_at
+            FROM document_versions
+            WHERE id = ?
+            """,
+            (version_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_published_version_id(document_id: str) -> Optional[str]:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM document_versions
+            WHERE document_id = ? AND published = 1
+            ORDER BY version_no DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return row["id"]
+
+
+def count_embeddings_for_version(version_id: str) -> int:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM chunks
+            WHERE version_id = ?
+              AND embedding IS NOT NULL
+              AND embedding != ''
+            """,
+            (version_id,),
+        ).fetchone()
+    return int(row["cnt"] or 0)
 
 
 def delete_chunks_for_document(document_id: str) -> None:
@@ -405,16 +800,26 @@ def delete_chunks_for_document(document_id: str) -> None:
         conn.commit()
 
 
+def delete_chunks_for_version(version_id: str) -> None:
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute("DELETE FROM chunks WHERE version_id = ?", (version_id,))
+        conn.commit()
+
+
 def store_chunks(
     *,
     document_id: str,
     user_id: str,
+    tenant_id: Optional[str],
     chunks: Iterable[Dict[str, Any]],
 ) -> None:
     conn = _get_connection()
     payload = [
         (
             chunk["id"],
+            chunk.get("version_id"),
+            tenant_id,
             document_id,
             user_id,
             chunk["chunk_index"],
@@ -430,6 +835,8 @@ def store_chunks(
             """
             INSERT OR REPLACE INTO chunks (
                 id,
+                version_id,
+                tenant_id,
                 document_id,
                 user_id,
                 chunk_index,
@@ -437,29 +844,77 @@ def store_chunks(
                 embedding,
                 metadata,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
         conn.commit()
 
 
-def iter_user_chunks(user_id: str) -> Iterable[Dict[str, Any]]:
+def iter_user_chunks(user_id: str, tenant_id: Optional[str] = None) -> Iterable[Dict[str, Any]]:
     conn = _get_connection()
+    params: List[Any] = [user_id]
+    tenant_clause = ""
+    if tenant_id is not None:
+        tenant_clause = "AND (tenant_id = ? OR tenant_id IS NULL)"
+        params.append(tenant_id)
     with _LOCK:
         rows = conn.execute(
-            """
-            SELECT id, document_id, chunk_index, content, embedding, metadata
+            f"""
+            SELECT id, version_id, document_id, chunk_index, content, embedding, metadata
             FROM chunks
             WHERE user_id = ?
+            {tenant_clause}
             """,
-            (user_id,),
+            params,
         ).fetchall()
     for row in rows:
         embedding = json.loads(row["embedding"])
         metadata = json.loads(row["metadata"]) if row["metadata"] else {}
         yield {
             "id": row["id"],
+            "version_id": row["version_id"],
+            "document_id": row["document_id"],
+            "chunk_index": row["chunk_index"],
+            "content": row["content"],
+            "embedding": embedding,
+            "metadata": metadata,
+        }
+
+
+def iter_published_chunks(user_id: str, tenant_id: Optional[str] = None) -> Iterable[Dict[str, Any]]:
+    conn = _get_connection()
+    params: List[Any] = [user_id]
+    tenant_clause = ""
+    if tenant_id is not None:
+        tenant_clause = "AND (d.tenant_id = ? OR d.tenant_id IS NULL)"
+        params.append(tenant_id)
+    with _LOCK:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.id,
+                c.version_id,
+                c.document_id,
+                c.chunk_index,
+                c.content,
+                c.embedding,
+                c.metadata
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            LEFT JOIN document_versions v ON v.id = c.version_id
+            WHERE d.user_id = ?
+              AND (c.version_id IS NULL OR v.published = 1)
+              {tenant_clause}
+            """,
+            params,
+        ).fetchall()
+    for row in rows:
+        embedding = json.loads(row["embedding"])
+        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        yield {
+            "id": row["id"],
+            "version_id": row["version_id"],
             "document_id": row["document_id"],
             "chunk_index": row["chunk_index"],
             "content": row["content"],
@@ -606,12 +1061,248 @@ def delete_chat_thread(thread_id: str, user_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def ensure_memory_document(user_id: str) -> str:
+def create_ingestion_job(
+    *,
+    user_id: str,
+    tenant_id: Optional[str],
+    source: str,
+    params: Optional[Dict[str, Any]],
+    status: str = "queued",
+    total: int = 0,
+) -> str:
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    conn = _get_connection()
+    params_json = json.dumps(params or {}, ensure_ascii=False)
+    with _LOCK:
+        conn.execute(
+            """
+            INSERT INTO ingestion_jobs (
+                id, tenant_id, user_id, source, params_json, status, total, processed, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (job_id, tenant_id, user_id, source, params_json, status, int(total), now, now),
+        )
+        conn.commit()
+    return job_id
+
+
+def update_ingestion_job(
+    job_id: str,
+    *,
+    status: Optional[str] = None,
+    error: Optional[str] = None,
+    total: Optional[int] = None,
+    processed: Optional[int] = None,
+) -> None:
+    fields = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if error is not None:
+        fields.append("error = ?")
+        params.append(error)
+    if total is not None:
+        fields.append("total = ?")
+        params.append(int(total))
+    if processed is not None:
+        fields.append("processed = ?")
+        params.append(int(processed))
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(time.time())
+    params.append(job_id)
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            f"UPDATE ingestion_jobs SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+
+
+def create_ingestion_task(
+    job_id: str,
+    *,
+    document_id: Optional[str],
+    version_id: Optional[str],
+    step: str,
+    status: str = "queued",
+) -> str:
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            """
+            INSERT INTO ingestion_tasks (
+                id, job_id, document_id, version_id, step, status, attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (task_id, job_id, document_id, version_id, step, status, now, now),
+        )
+        conn.commit()
+    return task_id
+
+
+def update_ingestion_task(
+    task_id: str, *, status: Optional[str] = None, error: Optional[str] = None, attempts: Optional[int] = None
+) -> None:
+    fields = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if error is not None:
+        fields.append("error = ?")
+        params.append(error)
+    if attempts is not None:
+        fields.append("attempts = ?")
+        params.append(int(attempts))
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(time.time())
+    params.append(task_id)
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            f"UPDATE ingestion_tasks SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+
+
+def get_ingestion_job(job_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            """
+            SELECT id, tenant_id, user_id, source, params_json, status, error, total, processed, created_at, updated_at
+            FROM ingestion_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        **dict(row),
+        "params": json.loads(row["params_json"] or "{}"),
+    }
+
+
+def list_ingestion_jobs(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _get_connection()
+    with _LOCK:
+        rows = conn.execute(
+            """
+            SELECT id, tenant_id, user_id, source, params_json, status, error, total, processed, created_at, updated_at
+            FROM ingestion_jobs
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, max(1, limit)),
+        ).fetchall()
+    return [
+        {
+            **dict(row),
+            "params": json.loads(row["params_json"] or "{}"),
+        }
+        for row in rows
+    ]
+
+
+def list_ingestion_tasks(job_id: str) -> List[Dict[str, Any]]:
+    conn = _get_connection()
+    with _LOCK:
+        rows = conn.execute(
+            """
+            SELECT id, job_id, document_id, version_id, step, status, error, attempts, created_at, updated_at
+            FROM ingestion_tasks
+            WHERE job_id = ?
+            ORDER BY created_at ASC
+            """,
+            (job_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_vector_stats(
+    *,
+    tenant_id: Optional[str],
+    document_id: Optional[str],
+    version_id: Optional[str],
+    expected_vectors: Optional[int],
+    stored_vectors: Optional[int],
+    health_status: str,
+    notes: Optional[str] = None,
+) -> str:
+    stat_id = uuid.uuid4().hex
+    now = time.time()
+    conn = _get_connection()
+    with _LOCK:
+        conn.execute(
+            """
+            INSERT INTO vector_stats (
+                id, tenant_id, document_id, version_id, expected_vectors, stored_vectors, last_checked_at, health_status, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stat_id,
+                tenant_id,
+                document_id,
+                version_id,
+                expected_vectors,
+                stored_vectors,
+                now,
+                health_status,
+                notes,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    return stat_id
+
+
+def list_vector_stats(document_ids: Optional[List[str]] = None, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_connection()
+    params: List[Any] = []
+    where_clauses: List[str] = []
+    if document_ids:
+        placeholders = ", ".join("?" for _ in document_ids)
+        where_clauses.append(f"document_id IN ({placeholders})")
+        params.extend(document_ids)
+    if tenant_id is not None:
+        where_clauses.append("(tenant_id = ? OR tenant_id IS NULL)")
+        params.append(tenant_id)
+    where = ""
+    if where_clauses:
+        where = "WHERE " + " AND ".join(where_clauses)
+    with _LOCK:
+        rows = conn.execute(
+            f"""
+            SELECT id, tenant_id, document_id, version_id, expected_vectors, stored_vectors, last_checked_at, health_status, notes, created_at, updated_at
+            FROM vector_stats
+            {where}
+            ORDER BY created_at DESC
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def ensure_memory_document(user_id: str, tenant_id: Optional[str] = None) -> str:
     memory_doc_id = f"memory::{user_id}"
     if get_document(memory_doc_id):
         return memory_doc_id
     create_document(
         document_id=memory_doc_id,
+        tenant_id=tenant_id,
         user_id=user_id,
         filename="Conversation memory",
         path=None,

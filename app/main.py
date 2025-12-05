@@ -16,7 +16,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 import threading
 
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -26,6 +25,7 @@ from fastapi import (
     UploadFile,
     Request,
     Response,
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
@@ -37,13 +37,15 @@ from starlette import status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from . import storage
+from .settings import load_settings, AppSettings
 from .graph import (
     build_step_instruction,
     compiled_graph,
     get_tool_budget_settings,
     update_tool_budget_settings,
 )
-from .rag import process_document_file, retrieve
+from .rag import retrieve, user_index_size, _rebuild_vector_index, index_ids_for_user
+from .task_queue import enqueue_process_document, enqueue_ingestion_job
 
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,11 @@ ALLOW_USER_REGISTRATION = str(os.getenv("AUTH_ALLOW_REGISTRATION", "1")).strip()
     "false",
     "no",
 }
+try:
+    settings = load_settings()
+except Exception as exc:  # pragma: no cover - startup guard
+    logger.warning("config validation failed: %s (continuing with environment defaults for dev)", exc)
+    settings = None
 
 
 class ChatReq(BaseModel):
@@ -133,6 +140,21 @@ class ThreadCreateReq(BaseModel):
 
 class ThreadUpdateReq(BaseModel):
     title: Optional[str] = None
+
+
+class IngestionJobCreateReq(BaseModel):
+    user_id: str
+    source: str
+    items: List[str] = []
+    tenant_id: Optional[str] = None
+    params: Optional[Dict[str, Any]] = None
+
+
+class ReindexReq(BaseModel):
+    user_id: str
+    document_ids: List[str] = []
+    embedding_model: Optional[str] = None
+    tenant_id: Optional[str] = None
 
 
 class SlidingWindowRateLimiter:
@@ -356,6 +378,16 @@ def _assert_user_scope(user_id: str, token_subject: Optional[str]) -> None:
     if AUTH_SECRET_KEY and token_subject and token_subject != "static-token" and token_subject != user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token does not match user_id")
 
+def _resolve_tenant_id(request: Request, tenant_id: Optional[str] = None) -> str:
+    candidate = (tenant_id or "").strip()
+    if not candidate:
+        candidate = (request.headers.get("x-tenant-id") or "").strip()
+    if not candidate:
+        candidate = request.query_params.get("tenant_id", "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    return candidate
+
 
 def _parse_bool_flag(value: Optional[Any]) -> bool:
     if isinstance(value, bool):
@@ -372,6 +404,11 @@ def _sanitize_user_folder(user_id: str) -> Path:
     folder = DOCS_ROOT / safe
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def _is_remote_source(item: str) -> bool:
+    lowered = item.lower()
+    return lowered.startswith("http://") or lowered.startswith("https://") or lowered.startswith("s3://")
 
 def _safe_filename(name: Optional[str]) -> str:
     if not name:
@@ -540,12 +577,15 @@ def chat(body: ChatReq, provided_token: str = Depends(enforce_rate_limit)) -> Ch
     return ChatResp(reply=reply)
 
 
-def _process_document_background(document_id: str, user_id: str, dest_path: Path) -> None:
-    try:
-        process_document_file(document_id=document_id, user_id=user_id, file_path=dest_path)
-    except Exception as exc:  # pragma: no cover - background worker
-        logger.exception("document processing failed doc=%s user=%s", document_id, user_id)
-        storage.update_document_status(document_id, status="failed", error=str(exc))
+def _process_document_background(document_id: str, user_id: str, dest_path: Path, version_id: Optional[str] = None) -> None:
+    # Deprecated placeholder retained for compatibility; now routed through Celery task queue.
+    enqueue_process_document(
+        document_id=document_id,
+        user_id=user_id,
+        path=str(dest_path),
+        version_id=version_id,
+        publish=True,
+    )
 
 
 @app.get("/chat/stream")
@@ -849,8 +889,9 @@ def chat_thread_messages(
 
 @app.post("/documents", status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
-    background_tasks: BackgroundTasks,
+    request: Request,
     user_id: str = Form(...),
+    tenant_id: Optional[str] = Form(None),
     file: UploadFile = File(...),
     provided_token: str = Depends(enforce_rate_limit),
 ):
@@ -858,6 +899,7 @@ async def upload_document(
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     storage.upsert_user(normalized_user)
 
     document_id = uuid.uuid4().hex
@@ -871,8 +913,9 @@ async def upload_document(
     size_bytes: Optional[float] = float(len(content))
     mime_type = file.content_type or None
 
-    storage.create_document(
+    version_id = storage.create_document(
         document_id=document_id,
+        tenant_id=resolved_tenant,
         user_id=normalized_user,
         filename=filename,
         path=str(destination),
@@ -881,11 +924,13 @@ async def upload_document(
         mime_type=mime_type,
         content_type=mime_type,
     )
-    background_tasks.add_task(
-        _process_document_background,
-        document_id,
-        normalized_user,
-        destination,
+    enqueue_process_document(
+        document_id=document_id,
+        user_id=normalized_user,
+        path=str(destination),
+        version_id=version_id,
+        publish=True,
+        tenant_id=resolved_tenant,
     )
     logger.info(
         "document uploaded doc_id=%s user=%s filename=%s bytes=%s",
@@ -897,36 +942,131 @@ async def upload_document(
     return {"id": document_id, "status": "processing"}
 
 
-@app.get("/documents")
-def list_documents(user_id: str, provided_token: str = Depends(enforce_rate_limit)):
+@app.post("/documents/{document_id}/versions/upload", status_code=status.HTTP_202_ACCEPTED)
+async def upload_document_version(
+    request: Request,
+    document_id: str,
+    user_id: str = Form(...),
+    tenant_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    provided_token: str = Depends(enforce_rate_limit),
+):
     normalized_user = (user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    doc = storage.get_document(document_id)
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    filename = _safe_filename(file.filename)
+    user_dir = _sanitize_user_folder(normalized_user)
+    destination = user_dir / f"{uuid.uuid4().hex}_{filename}"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    destination.write_bytes(content)
+    size_bytes: Optional[float] = float(len(content))
+    mime_type = file.content_type or None
+
+    version_id = storage.create_document_version(
+        document_id=document_id,
+        parent_version_id=doc.get("latest_version_id"),
+        status="processing",
+        path_raw=str(destination),
+        path_text=None,
+        embedding_model=None,
+        published=False,
+    )
+    enqueue_process_document(
+        document_id=document_id,
+        user_id=normalized_user,
+        path=str(destination),
+        version_id=version_id,
+        publish=True,
+        tenant_id=resolved_tenant,
+    )
+    logger.info(
+        "document new version uploaded doc_id=%s version=%s user=%s filename=%s bytes=%s",
+        document_id,
+        version_id,
+        normalized_user,
+        filename,
+        len(content),
+    )
+    return {"document_id": document_id, "version_id": version_id, "status": "processing"}
+
+
+@app.get("/documents")
+def list_documents(request: Request, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     storage.upsert_user(normalized_user)
-    return {"items": storage.list_documents(normalized_user)}
+    return {"items": storage.list_documents(normalized_user, tenant_id=resolved_tenant)}
 
 
 @app.get("/documents/{document_id}")
-def get_document(document_id: str, user_id: str, provided_token: str = Depends(enforce_rate_limit)):
+def get_document(request: Request, document_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
     normalized_user = (user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     doc = storage.get_document(document_id)
-    if not doc or doc.get("user_id") != normalized_user:
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
 
-@app.get("/documents/{document_id}/download")
-def download_document(document_id: str, user_id: str, provided_token: str = Depends(enforce_rate_limit)):
+@app.get("/documents/{document_id}/versions")
+def list_document_versions(request: Request, document_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
     normalized_user = (user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     doc = storage.get_document(document_id)
-    if not doc or doc.get("user_id") != normalized_user:
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"items": storage.get_document_versions(document_id)}
+
+
+@app.post("/documents/{document_id}/versions/{version_id}/publish")
+def publish_document_version(request: Request, document_id: str, version_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    doc = storage.get_document(document_id)
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
+        raise HTTPException(status_code=404, detail="Document not found")
+    version = storage.get_document_version(version_id)
+    if not version or version.get("document_id") != document_id:
+        raise HTTPException(status_code=404, detail="Version not found")
+    storage.publish_document_version(document_id, version_id)
+    return {"document_id": document_id, "version_id": version_id, "status": "published"}
+
+
+@app.post("/documents/{document_id}/versions/{version_id}/rollback")
+def rollback_document_version(request: Request, document_id: str, version_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
+    # rollback is equivalent to publishing a previous version
+    return publish_document_version(request, document_id, version_id, user_id, tenant_id, provided_token)
+
+
+@app.get("/documents/{document_id}/download")
+def download_document(request: Request, document_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    doc = storage.get_document(document_id)
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
         raise HTTPException(status_code=404, detail="Document not found")
     path = doc.get("path")
     if not path or not Path(path).exists():
@@ -937,40 +1077,46 @@ def download_document(document_id: str, user_id: str, provided_token: str = Depe
 
 @app.post("/documents/{document_id}/retry", status_code=status.HTTP_202_ACCEPTED)
 def retry_document(
+    request: Request,
     document_id: str,
     user_id: str,
-    background_tasks: BackgroundTasks,
+    tenant_id: Optional[str] = None,
     provided_token: str = Depends(enforce_rate_limit),
 ):
     normalized_user = (user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     doc = storage.get_document(document_id)
-    if not doc or doc.get("user_id") != normalized_user:
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
         raise HTTPException(status_code=404, detail="Document not found")
     path = doc.get("path")
     if not path or not Path(path).exists():
         raise HTTPException(status_code=400, detail="Document file is missing; please re-upload.")
     storage.update_document_status(document_id, status="processing", error=None, path=path)
-    background_tasks.add_task(
-        _process_document_background,
-        document_id,
-        normalized_user,
-        Path(path),
+    version_id = storage.get_latest_version_id(document_id)
+    enqueue_process_document(
+        document_id=document_id,
+        user_id=normalized_user,
+        path=path,
+        version_id=version_id,
+        publish=True,
+        tenant_id=resolved_tenant,
     )
     logger.info("document retry queued doc_id=%s user=%s", document_id, normalized_user)
     return {"id": document_id, "status": "processing"}
 
 
 @app.delete("/documents/{document_id}")
-def delete_document(document_id: str, user_id: str, provided_token: str = Depends(enforce_rate_limit)):
+def delete_document(request: Request, document_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
     normalized_user = (user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
     _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
     doc = storage.get_document(document_id)
-    if not doc or doc.get("user_id") != normalized_user:
+    if not doc or doc.get("user_id") != normalized_user or (doc.get("tenant_id") not in {None, resolved_tenant}):
         raise HTTPException(status_code=404, detail="Document not found")
     path = doc.get("path")
     storage.delete_document(document_id)
@@ -981,6 +1127,200 @@ def delete_document(document_id: str, user_id: str, provided_token: str = Depend
             logger.warning("failed to delete document file path=%s", path, exc_info=True)
     logger.info("document deleted doc_id=%s user=%s", document_id, normalized_user)
     return {"id": document_id, "status": "deleted"}
+
+
+@app.post("/ingestion_jobs", status_code=status.HTTP_202_ACCEPTED)
+def create_ingestion_job(request: Request, payload: IngestionJobCreateReq, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (payload.user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    items = payload.items or []
+    resolved_tenant = _resolve_tenant_id(request, payload.tenant_id)
+    job_id = storage.create_ingestion_job(
+        user_id=normalized_user,
+        tenant_id=resolved_tenant,
+        source=payload.source,
+        params=payload.params or {},
+        status="queued",
+        total=len(items),
+    )
+    task_ids: List[str] = []
+    for item in items:
+        is_remote = _is_remote_source(item)
+        item_path = Path(item)
+        if not is_remote and not item_path.exists():
+            storage.update_ingestion_job(job_id, status="failed", error=f"File not found: {item}")
+            return {"job_id": job_id, "status": "failed", "error": f"File not found: {item}"}
+        filename = _safe_filename(item_path.name if not is_remote else item_path.name or Path(item).name or "remote_file")
+        size_bytes = float(item_path.stat().st_size) if not is_remote else None
+        mime_type = None
+        document_id = uuid.uuid4().hex
+        version_id = storage.create_document(
+            document_id=document_id,
+            tenant_id=resolved_tenant,
+            user_id=normalized_user,
+            filename=filename,
+            path=str(item),
+            status="processing",
+            size_bytes=size_bytes,
+            mime_type=mime_type,
+            content_type=mime_type,
+        )
+        task_ids.append(
+            storage.create_ingestion_task(
+                job_id,
+                document_id=document_id,
+                version_id=version_id,
+                step="ingest",
+                status="queued",
+            )
+        )
+    enqueue_ingestion_job(job_id, normalized_user, task_ids)
+    return {"job_id": job_id, "status": "queued", "tasks": len(task_ids)}
+
+
+@app.get("/ingestion_jobs")
+def list_ingestion_jobs(request: Request, user_id: str, tenant_id: Optional[str] = None, limit: int = 50, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    items = [
+        job for job in storage.list_ingestion_jobs(normalized_user, limit=limit)
+        if job.get("tenant_id") in {None, resolved_tenant}
+    ]
+    return {"items": items}
+
+
+@app.get("/ingestion_jobs/{job_id}")
+def get_ingestion_job(request: Request, job_id: str, user_id: str, tenant_id: Optional[str] = None, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    job = storage.get_ingestion_job(job_id)
+    if not job or job.get("user_id") != normalized_user or (job.get("tenant_id") not in {None, resolved_tenant}):
+        raise HTTPException(status_code=404, detail="Job not found")
+    tasks = storage.list_ingestion_tasks(job_id)
+    return {"job": job, "tasks": tasks}
+
+
+@app.post("/reindex", status_code=status.HTTP_202_ACCEPTED)
+def trigger_reindex(request: Request, payload: ReindexReq, provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (payload.user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, payload.tenant_id)
+    user_docs: Dict[str, Dict[str, Any]] = {doc["id"]: doc for doc in storage.list_documents(normalized_user, tenant_id=resolved_tenant)}
+    doc_ids = [doc_id for doc_id in (payload.document_ids or []) if doc_id in user_docs]
+    if not doc_ids:
+        raise HTTPException(status_code=404, detail="No documents found for user")
+    for doc_id in doc_ids:
+        storage.update_document_status(doc_id, status="processing", error=None, path=user_docs[doc_id].get("path"))
+    job_id = storage.create_ingestion_job(
+        user_id=normalized_user,
+        tenant_id=payload.tenant_id,
+        source="reindex",
+        params={"embedding_model": payload.embedding_model},
+        status="queued",
+        total=len(doc_ids),
+    )
+    task_ids: List[str] = []
+    for doc_id in doc_ids:
+        version_id = storage.create_document_version(
+            doc_id,
+            status="pending",
+            path_raw=None,
+            path_text=None,
+            embedding_model=payload.embedding_model,
+            published=False,
+        )
+        task_ids.append(
+            storage.create_ingestion_task(
+                job_id,
+                document_id=doc_id,
+                version_id=version_id,
+                step="reindex",
+                status="queued",
+            )
+        )
+    enqueue_ingestion_job(job_id, normalized_user, task_ids)
+    return {"job_id": job_id, "status": "queued", "tasks": len(task_ids)}
+
+
+@app.get("/ops/vector/health")
+def vector_health(request: Request, user_id: str, tenant_id: Optional[str] = None, document_ids: Optional[List[str]] = Query(None), provided_token: str = Depends(enforce_rate_limit)):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+    user_docs: Set[str] = {doc["id"] for doc in storage.list_documents(normalized_user, tenant_id=resolved_tenant)}
+    ids = document_ids or []
+    if ids:
+        ids = [doc_id for doc_id in ids if doc_id in user_docs]
+        if not ids:
+            raise HTTPException(status_code=404, detail="Documents not found for user")
+    else:
+        ids = list(user_docs)
+    items: List[Dict[str, Any]] = []
+    index_size = user_index_size(normalized_user)
+    index_doc_ids = index_ids_for_user(normalized_user)
+    for doc_id in ids:
+        versions = storage.get_document_versions(doc_id)
+        published_version = next((v for v in versions if v.get("published")), None)
+        active_version_id = (published_version or (versions[0] if versions else {})).get("id")
+        expected = 0
+        stored = 0
+        if published_version:
+            expected = published_version.get("chunk_count") or storage.count_embeddings_for_version(published_version["id"])
+        else:
+            latest = versions[0] if versions else None
+            if latest:
+                expected = latest.get("chunk_count") or storage.count_embeddings_for_version(latest["id"])
+        # approximate stored by counting chunks for the published version
+        if published_version:
+            stored = storage.count_embeddings_for_version(published_version["id"])
+        elif active_version_id:
+            stored = storage.count_embeddings_for_version(active_version_id)
+        health_status = "healthy"
+        notes: Optional[str] = None
+        if expected == 0:
+            health_status = "unknown"
+            notes = "no published chunks found."
+        elif stored < expected:
+            health_status = "degraded"
+            notes = f"stored vectors {stored} < expected {expected}."
+        if doc_id not in index_doc_ids and expected > 0:
+            health_status = "degraded"
+            notes = (notes or "") + " index missing document vectors."
+        storage.upsert_vector_stats(
+            tenant_id=tenant_id,
+            document_id=doc_id,
+            version_id=active_version_id,
+            expected_vectors=expected,
+            stored_vectors=stored,
+            health_status=health_status,
+            notes=notes,
+        )
+        items.append(
+            {
+                "document_id": doc_id,
+                "version_id": active_version_id,
+                "expected_vectors": expected,
+                "stored_vectors": stored,
+                "health_status": health_status,
+                "notes": notes,
+                "published": bool(published_version),
+                "in_index": doc_id in index_doc_ids,
+                "user_index_vectors": index_size,
+            }
+        )
+    return {"items": items}
 
 
 @app.get("/config/tool-budget", response_model=ToolBudgetConfig)
