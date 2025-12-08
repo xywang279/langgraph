@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 import os
 
+import io
 import json
 import logging
 import time
@@ -108,6 +109,44 @@ try:
 except Exception as exc:  # pragma: no cover - startup guard
     logger.warning("config validation failed: %s (continuing with environment defaults for dev)", exc)
     settings = None
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no"}
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+MAX_UPLOAD_BYTES = max(0, _parse_int_env("UPLOAD_MAX_BYTES", 20_000_000))  # 20 MB default
+ALLOWED_UPLOAD_EXTS = {
+    ext.strip().lower()
+    for ext in (os.getenv("UPLOAD_ALLOWED_EXTS") or ".pdf,.txt,.md,.doc,.docx,.png,.jpg,.jpeg,.bmp,.tiff,.csv")
+    .split(",")
+    if ext.strip()
+}
+ALLOWED_MIME_PREFIXES = {
+    prefix.strip().lower()
+    for prefix in (os.getenv("UPLOAD_ALLOWED_MIME_PREFIXES") or "application/pdf,text/,image/")
+    .split(",")
+    if prefix.strip()
+}
+ENABLE_VIRUS_SCAN = _parse_bool_env("UPLOAD_ENABLE_VIRUS_SCAN", False)
+BLOCKED_KEYWORDS = [
+    keyword.strip().lower()
+    for keyword in (os.getenv("UPLOAD_BLOCKED_KEYWORDS") or "").split(",")
+    if keyword.strip()
+]
 
 
 class ChatReq(BaseModel):
@@ -415,6 +454,76 @@ def _safe_filename(name: Optional[str]) -> str:
         return 'upload.txt'
     clean = Path(name).name.strip()
     return clean or 'upload.txt'
+
+
+def _scan_upload(content: bytes, filename: str) -> None:
+    """Best-effort upload guard: keyword blocklist + optional antivirus hook."""
+    if BLOCKED_KEYWORDS:
+        try:
+            text = content.decode("utf-8", errors="ignore").lower()
+            for keyword in BLOCKED_KEYWORDS:
+                if keyword and keyword in text:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Upload blocked by content policy: '{keyword}' detected.",
+                    )
+        except HTTPException:
+            raise
+        except Exception:  # pragma: no cover
+            logger.warning("keyword scan failed filename=%s", filename, exc_info=True)
+
+    if not ENABLE_VIRUS_SCAN:
+        return
+    try:
+        import clamd  # type: ignore
+
+        client = clamd.ClamdNetworkSocket()
+        result = client.instream(io.BytesIO(content))
+        verdict = result.get("stream") if isinstance(result, dict) else None
+        if isinstance(verdict, tuple) and len(verdict) >= 2 and verdict[0] == "FOUND":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Virus detected: {verdict[1]}",
+            )
+    except HTTPException:
+        raise
+    except ImportError:  # pragma: no cover - optional dependency
+        logger.warning("UPLOAD_ENABLE_VIRUS_SCAN=1 but clamd is not installed; skipping AV scan.")
+    except Exception:  # pragma: no cover - best effort
+        logger.warning("virus scan failed filename=%s", filename, exc_info=True)
+
+
+def _validate_upload(file: UploadFile, content: bytes) -> Dict[str, Any]:
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    size_bytes = len(content)
+    if MAX_UPLOAD_BYTES and size_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large: {size_bytes} bytes (limit {MAX_UPLOAD_BYTES}).",
+        )
+
+    filename = _safe_filename(file.filename)
+    ext = Path(filename).suffix.lower()
+    mime_type = (file.content_type or "").split(";")[0].strip().lower() or None
+
+    if ALLOWED_UPLOAD_EXTS and ext not in ALLOWED_UPLOAD_EXTS:
+        allowed = ", ".join(sorted(ALLOWED_UPLOAD_EXTS))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File extension '{ext or 'unknown'}' is not allowed. Allowed: {allowed}",
+        )
+    if ALLOWED_MIME_PREFIXES and mime_type:
+        if all(not mime_type.startswith(prefix) for prefix in ALLOWED_MIME_PREFIXES):
+            allowed = ", ".join(sorted(ALLOWED_MIME_PREFIXES))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"MIME type '{mime_type}' is not allowed. Allowed prefixes: {allowed}",
+            )
+
+    _scan_upload(content, filename)
+    return {"size_bytes": float(size_bytes), "mime_type": mime_type}
 
 def _normalize_tool_payload(content: Any, tool_name: str) -> Dict[str, Any]:
     if isinstance(content, dict):
@@ -907,11 +1016,10 @@ async def upload_document(
     user_dir = _sanitize_user_folder(normalized_user)
     destination = user_dir / f"{document_id}_{filename}"
     content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    meta = _validate_upload(file, content)
     destination.write_bytes(content)
-    size_bytes: Optional[float] = float(len(content))
-    mime_type = file.content_type or None
+    size_bytes: Optional[float] = meta.get("size_bytes")
+    mime_type = meta.get("mime_type")
 
     version_id = storage.create_document(
         document_id=document_id,
@@ -964,11 +1072,10 @@ async def upload_document_version(
     user_dir = _sanitize_user_folder(normalized_user)
     destination = user_dir / f"{uuid.uuid4().hex}_{filename}"
     content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    meta = _validate_upload(file, content)
     destination.write_bytes(content)
-    size_bytes: Optional[float] = float(len(content))
-    mime_type = file.content_type or None
+    size_bytes: Optional[float] = meta.get("size_bytes")
+    mime_type = meta.get("mime_type")
 
     version_id = storage.create_document_version(
         document_id=document_id,
