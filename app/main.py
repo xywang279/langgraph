@@ -131,13 +131,13 @@ def _parse_int_env(name: str, default: int) -> int:
 MAX_UPLOAD_BYTES = max(0, _parse_int_env("UPLOAD_MAX_BYTES", 20_000_000))  # 20 MB default
 ALLOWED_UPLOAD_EXTS = {
     ext.strip().lower()
-    for ext in (os.getenv("UPLOAD_ALLOWED_EXTS") or ".pdf,.txt,.md,.doc,.docx,.png,.jpg,.jpeg,.bmp,.tiff,.csv")
+    for ext in (os.getenv("UPLOAD_ALLOWED_EXTS") or ".pdf,.txt,.md,.doc,.docx,.png,.jpg,.jpeg,.bmp,.tiff,.csv,.wav,.mp3,.m4a,.flac,.ogg,.aac,.wma,.webm")
     .split(",")
     if ext.strip()
 }
 ALLOWED_MIME_PREFIXES = {
     prefix.strip().lower()
-    for prefix in (os.getenv("UPLOAD_ALLOWED_MIME_PREFIXES") or "application/pdf,text/,image/")
+    for prefix in (os.getenv("UPLOAD_ALLOWED_MIME_PREFIXES") or "application/pdf,text/,image/,audio/")
     .split(",")
     if prefix.strip()
 }

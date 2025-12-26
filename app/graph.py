@@ -1197,19 +1197,28 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
         return {"messages": []}
 
     step_id = state.get("active_step_id")
-    tasks: List[Dict[str, Any]] = []
-    seen_calls = set()
+    # Group duplicate tool calls (same name + same args) so we can execute once but
+    # still emit a ToolMessage for every tool_call_id. This avoids OpenAI 400 errors:
+    # "An assistant message with 'tool_calls' must be followed by tool messages..."
+    tasks_by_key: Dict[Tuple[Optional[str], str], Dict[str, Any]] = {}
     for call in tool_calls:
         args = call.get("args") or {}
         merged_args = _merge_context_args(call.get("name"), args, state)
         call["args"] = merged_args
-        spec = _get_spec(call["name"] or "")
+        spec = _get_spec(call.get("name") or "")
         key = (call.get("name"), json.dumps(call["args"], sort_keys=True))
-        if key in seen_calls:
-            continue
-        seen_calls.add(key)
-        tasks.append({"call": call, "spec": spec, "args": call["args"]})
+        task = tasks_by_key.get(key)
+        if task is None:
+            tasks_by_key[key] = {
+                "call": call,  # representative call
+                "spec": spec,
+                "args": call["args"],
+                "calls": [call],  # all calls in this group
+            }
+        else:
+            task["calls"].append(call)
 
+    tasks: List[Dict[str, Any]] = list(tasks_by_key.values())
     if not tasks:
         return {"messages": []}
 
@@ -1225,13 +1234,14 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
     results: Dict[int, ToolMessage] = {}
     synthetic_assistant: Optional[AIMessage] = None
     for task in trimmed_tasks:
-        idx = task["call"]["index"]
-        results[idx] = _skip_task_message(
-            task,
-            f"Skipped because tool budget only allows {budget.max_tasks} calls per turn.",
-            step_id,
-            code="max_calls",
-        )
+        for call in task.get("calls", []) or [task["call"]]:
+            idx = call["index"]
+            results[idx] = _skip_task_message(
+                {"call": call, "spec": task["spec"]},
+                f"Skipped because tool budget only allows {budget.max_tasks} calls per turn.",
+                step_id,
+                code="max_calls",
+            )
     if trimmed_tasks:
         TOOL_THROTTLE_COUNTER.labels(reason="max_calls").inc(len(trimmed_tasks))
         logger.warning(
@@ -1300,8 +1310,9 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
         for task, outcome in _run_parallel_batch(batch):
             if step_id:
                 outcome.setdefault("step_id", step_id)
-            idx = task["call"]["index"]
-            results[idx] = _build_tool_message(task["call"], outcome, step_id)
+            for call in task.get("calls", []) or [task["call"]]:
+                idx = call["index"]
+                results[idx] = _build_tool_message(call, outcome, step_id)
             _record_latency(outcome)
 
     while serial_queue and not budget_stop:
@@ -1309,18 +1320,25 @@ def tool_orchestrator(state: AgentState) -> Dict[str, List[ToolMessage]]:
         outcome = _execute_tool(task["call"]["name"], task["args"], task["spec"])
         if step_id:
             outcome.setdefault("step_id", step_id)
-        idx = task["call"]["index"]
-        results[idx] = _build_tool_message(task["call"], outcome, step_id)
+        for call in task.get("calls", []) or [task["call"]]:
+            idx = call["index"]
+            results[idx] = _build_tool_message(call, outcome, step_id)
         _record_latency(outcome)
 
     if budget_stop:
         pending = list(parallel_queue) + list(serial_queue)
         reason = budget_reason or "Resource budget exhausted before remaining tools could run."
         for task in pending:
-            idx = task["call"]["index"]
-            if idx in results:
-                continue
-            results[idx] = _skip_task_message(task, reason, step_id, code="latency_budget")
+            for call in task.get("calls", []) or [task["call"]]:
+                idx = call["index"]
+                if idx in results:
+                    continue
+                results[idx] = _skip_task_message(
+                    {"call": call, "spec": task["spec"]},
+                    reason,
+                    step_id,
+                    code="latency_budget",
+                )
         TOOL_THROTTLE_COUNTER.labels(reason="latency_budget").inc(len(pending))
         TOOL_LATENCY_BUDGET_EXHAUSTED.inc()
         logger.warning(
@@ -1416,6 +1434,52 @@ def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
             continue
         filtered_fixed.append(msg)
     filtered = filtered_fixed
+
+    # Repair the opposite mismatch: AIMessage.tool_calls without following ToolMessage(s).
+    # Some providers (or crashes mid-turn) can leave history in an invalid state, causing
+    # OpenAI-compatible APIs to return:
+    # "An assistant message with 'tool_calls' must be followed by tool messages..."
+    repaired: List[AnyMessage] = []
+    i = 0
+    while i < len(filtered):
+        msg = filtered[i]
+        repaired.append(msg)
+        if isinstance(msg, AIMessage):
+            calls = getattr(msg, "tool_calls", None) or []
+            if isinstance(calls, list) and calls:
+                expected_ids = [call.get("id") for call in calls if call.get("id")]
+                found_ids: set = set()
+                j = i + 1
+                while j < len(filtered) and isinstance(filtered[j], ToolMessage):
+                    tm = filtered[j]
+                    found_ids.add(getattr(tm, "tool_call_id", None))
+                    repaired.append(tm)
+                    j += 1
+                for call in calls:
+                    cid = call.get("id")
+                    if not cid or cid in found_ids:
+                        continue
+                    name = call.get("name") or "unknown"
+                    placeholder = {
+                        "tool": name,
+                        "status": "skipped",
+                        "observation": "Missing tool result in history; inserted placeholder to repair message order.",
+                        "latency": 0.0,
+                        "tries": 0,
+                        "error": "missing_tool_result",
+                        "tool_call_id": cid,
+                    }
+                    repaired.append(
+                        ToolMessage(
+                            content=json.dumps(placeholder, ensure_ascii=False),
+                            tool_call_id=cid,
+                            name=name,
+                        )
+                    )
+                i = j
+                continue
+        i += 1
+    filtered = repaired
 
     payload = {
         "system_prompt": SYSTEM_PROMPT,

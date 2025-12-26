@@ -519,7 +519,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
           <Text strong style={{ fontSize: 16 }}>Versions</Text>
           <Flex gap={8}>
             <Upload
-              accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg,.bmp,.tiff"
+              accept=".pdf,.doc,.docx,.txt,.csv,.png,.jpg,.jpeg,.bmp,.tiff,.wav,.mp3,.m4a,.flac,.ogg,.aac,.wma,.webm"
               showUploadList={false}
               customRequest={uploadNewVersionAction}
               disabled={uploadingVersion}

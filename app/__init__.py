@@ -1,6 +1,13 @@
 import logging
 from pathlib import Path
 
+try:  # best-effort: ensure .env is loaded regardless of process CWD (api / worker / scripts)
+    from dotenv import load_dotenv
+
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=False)
+except Exception:
+    pass
+
 from . import storage
 
 logging.basicConfig(
