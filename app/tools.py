@@ -18,7 +18,7 @@ from langchain_core.tools import tool
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field
 
-from .rag import retrieve
+from .rag import retrieve, _table_to_markdown
 
 load_dotenv()
 
@@ -48,6 +48,9 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
     return max(0.5, value)
+
+
+TABLE_CONTEXT_MAX_ROWS = _env_int("TABLE_CONTEXT_MAX_ROWS", 50)
 
 
 @dataclass(frozen=True)
@@ -658,8 +661,18 @@ def doc_insights(
             meta = record.get("metadata") or {}
             title = meta.get("filename") or meta.get("document_id") or "document"
             score = record.get("score")
-            snippet = (record.get("content") or "").strip()
-            snippet = snippet[:500]
+            rows = meta.get("rows")
+            table_md = ""
+            if meta.get("structure_type") == "table" and isinstance(rows, list) and rows:
+                limited_rows = rows[:TABLE_CONTEXT_MAX_ROWS]
+                table_md = _table_to_markdown(limited_rows)
+                if table_md and len(rows) > len(limited_rows):
+                    table_md += f"\n(Note: showing first {len(limited_rows)} rows of {len(rows)}.)"
+            if table_md:
+                snippet = table_md
+            else:
+                snippet = (record.get("content") or "").strip()
+                snippet = snippet[:500]
             lines.append(
                 f"{idx}. {title} (score={score})\n   {snippet}".rstrip()
             )

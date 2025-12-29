@@ -59,7 +59,7 @@ except Exception:
             return "__end__"
 
 from . import storage
-from .rag import retrieve, store_memory_snippet
+from .rag import retrieve, store_memory_snippet, _table_to_markdown
 from .tools import TOOL_REGISTRY, get_registered_tools
 
 load_dotenv()
@@ -80,6 +80,7 @@ logger = logging.getLogger(__name__)
 
 ENABLE_DOCUMENT_RETRIEVAL = os.getenv("ENABLE_DOCUMENT_RETRIEVAL", "true").strip().lower()
 ENABLE_DOCUMENT_RETRIEVAL = ENABLE_DOCUMENT_RETRIEVAL not in {"0", "false", "no"}
+TABLE_CONTEXT_MAX_ROWS = max(1, int(os.getenv("TABLE_CONTEXT_MAX_ROWS", "50") or 50))
 
 CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH") or str(
     Path(__file__).resolve().parent.parent / "data" / "checkpoints.sqlite3"
@@ -1396,9 +1397,20 @@ def agent(state: AgentState) -> Dict[str, List[AnyMessage]]:
     if retrievals:
         context_lines: List[str] = []
         for idx, item in enumerate(retrievals, start=1):
-            source = item.get("metadata", {}).get("filename") or item.get("document_id")
-            snippet = item.get("content", "")
-            context_lines.append(f"[{idx}] {source}: {snippet}")
+            metadata = item.get("metadata") or {}
+            source = metadata.get("filename") or item.get("document_id")
+            rows = metadata.get("rows")
+            table_md = ""
+            if metadata.get("structure_type") == "table" and isinstance(rows, list) and rows:
+                limited_rows = rows[:TABLE_CONTEXT_MAX_ROWS]
+                table_md = _table_to_markdown(limited_rows)
+                if table_md and len(rows) > len(limited_rows):
+                    table_md += f"\n(Note: showing first {len(limited_rows)} rows of {len(rows)}.)"
+            if table_md:
+                context_lines.append(f"[{idx}] {source} (table):\n{table_md}")
+            else:
+                snippet = item.get("content", "")
+                context_lines.append(f"[{idx}] {source}: {snippet}")
         context_messages.append(
             SystemMessage(
                 content="Relevant knowledge base entries:\n" + "\n".join(context_lines),

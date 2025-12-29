@@ -228,7 +228,20 @@ def index_ids_for_user(user_id: str) -> List[str]:
     if store is None:
         return []
     try:
-        return [metadata.get("document_id", "") for metadata in store.docstore._dict.values()]  # type: ignore
+        ids: List[str] = []
+        seen: set = set()
+        for entry in store.docstore._dict.values():  # type: ignore[attr-defined]
+            if isinstance(entry, dict):
+                metadata = entry
+            else:
+                metadata = getattr(entry, "metadata", None)
+            if isinstance(metadata, dict) and metadata.get("document_id"):
+                doc_id = metadata["document_id"]
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                ids.append(doc_id)
+        return ids
     except Exception:
         return []
 
@@ -574,8 +587,8 @@ def _looks_like_table_line(line: str) -> bool:
 
 
 def _is_table_divider(line: str) -> bool:
-    stripped = line.strip().strip("|").replace(":", "").replace("-", "")
-    return stripped == ""
+    cleaned = line.strip().replace("|", "").replace(":", "").replace("-", "").strip()
+    return cleaned == ""
 
 
 def _parse_markdown_table(lines: List[str]) -> List[List[str]]:

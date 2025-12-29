@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   Card,
   Flex,
@@ -67,6 +69,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
   const [versionsLoading, setVersionsLoading] = useState(false)
   const [previewUrl, setPreviewUrl] = useState(null)
   const [previewText, setPreviewText] = useState(null)
+  const [previewKind, setPreviewKind] = useState(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const previewCacheRef = React.useRef(new Map())
   const [uploadingVersion, setUploadingVersion] = useState(false)
@@ -98,6 +101,50 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
     if (lower.includes('image') || lower.includes('png') || lower.includes('jpg')) return <FileImageOutlined style={{ color: '#22c55e' }} />
     return <FileTextOutlined style={{ color: '#6366f1' }} />
   }
+
+  const isMarkdownFile = (name = '') => {
+    const lower = name.toLowerCase()
+    return lower.endsWith('.md') || lower.endsWith('.markdown') || lower.endsWith('.mkd') || lower.endsWith('.mdx')
+  }
+
+  const markdownComponents = useMemo(
+    () => ({
+      table: (props) => (
+        <table
+          {...props}
+          style={{
+            width: '100%',
+            borderCollapse: 'collapse',
+            margin: '8px 0',
+            fontSize: 13,
+          }}
+        />
+      ),
+      th: (props) => (
+        <th
+          {...props}
+          style={{
+            border: `1px solid ${antdToken.colorBorderSecondary}`,
+            padding: '6px 8px',
+            background: antdToken.colorFillSecondary,
+            textAlign: 'left',
+            fontWeight: 600,
+          }}
+        />
+      ),
+      td: (props) => (
+        <td
+          {...props}
+          style={{
+            border: `1px solid ${antdToken.colorBorderSecondary}`,
+            padding: '6px 8px',
+            verticalAlign: 'top',
+          }}
+        />
+      ),
+    }),
+    [antdToken]
+  )
 
   const buildUrl = (path) => {
     const search = new URLSearchParams({ user_id: userId, tenant_id: tenantId })
@@ -235,6 +282,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
       return null
     })
     setPreviewText(null)
+    setPreviewKind(null)
   }, [selectedDocId, loadVersions])
 
   const publishVersionAction = async (versionId) => {
@@ -292,6 +340,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
         const cached = previewCacheRef.current.get(docId)
         setPreviewText(cached.text || null)
         setPreviewUrl(cached.url || null)
+        setPreviewKind(cached.kind || null)
         setPreviewLoading(false)
         return
       }
@@ -301,6 +350,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
         if (prev) window.URL.revokeObjectURL(prev)
         return null
       })
+      setPreviewKind(null)
       try {
         const res = await fetch(buildUrl(`/documents/${docId}/download`), {
           headers: { ...authHeaders },
@@ -308,25 +358,40 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const blob = await res.blob()
         const mime = blob.type || doc.mime_type || doc.content_type || ''
+        const filename = doc.filename || ''
         let nextUrl = null
         let nextText = null
+        let nextKind = null
         if (mime.startsWith('image/')) {
           nextUrl = window.URL.createObjectURL(blob)
           setPreviewUrl(nextUrl)
+          nextKind = 'image'
         } else if (mime === 'application/pdf') {
           nextUrl = window.URL.createObjectURL(blob)
           setPreviewUrl(nextUrl)
+          nextKind = 'pdf'
         } else if (mime.startsWith('text/') || mime.includes('json')) {
           const text = await blob.text()
           nextText = text.slice(0, 4000)
           setPreviewText(nextText)
+          nextKind = mime === 'text/markdown' || isMarkdownFile(filename) ? 'markdown' : 'text'
+        } else if (isMarkdownFile(filename)) {
+          const text = await blob.text()
+          nextText = text.slice(0, 4000)
+          setPreviewText(nextText)
+          nextKind = 'markdown'
         } else {
           nextText = '预览暂不支持该文件类型，请下载查看。'
           setPreviewText(nextText)
         }
-        previewCacheRef.current.set(docId, { url: nextUrl, text: nextText })
+        if (!nextKind && nextText) {
+          nextKind = 'text'
+        }
+        setPreviewKind(nextKind)
+        previewCacheRef.current.set(docId, { url: nextUrl, text: nextText, kind: nextKind })
       } catch (err) {
         setPreviewText(err?.message || '预览失败')
+        setPreviewKind('text')
       } finally {
         setPreviewLoading(false)
       }
@@ -341,6 +406,7 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
         if (prev) window.URL.revokeObjectURL(prev)
         return null
       })
+      setPreviewKind(null)
       return
     }
     const doc = documents.find((d) => (d.id || d.document_id || d.pk) === selectedDocId)
@@ -598,12 +664,16 @@ export default function KnowledgePanel({ userId, apiToken, tenantId }) {
         >
           {previewLoading ? (
             <Spin />
-          ) : previewUrl ? (
-            selectedDoc.mime_type?.includes('pdf') || selectedDoc.content_type?.includes('pdf') ? (
-              <iframe title="preview" src={previewUrl} style={{ width: '100%', height: 360, border: 'none' }} />
-            ) : (
-              <img src={previewUrl} alt="preview" style={{ maxHeight: 360, maxWidth: '100%', objectFit: 'contain' }} />
-            )
+          ) : previewKind === 'pdf' && previewUrl ? (
+            <iframe title="preview" src={previewUrl} style={{ width: '100%', height: 360, border: 'none' }} />
+          ) : previewKind === 'image' && previewUrl ? (
+            <img src={previewUrl} alt="preview" style={{ maxHeight: 360, maxWidth: '100%', objectFit: 'contain' }} />
+          ) : previewKind === 'markdown' && previewText ? (
+            <div style={{ width: '100%', maxHeight: 360, overflowY: 'auto', color: '#0f172a' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {previewText}
+              </ReactMarkdown>
+            </div>
           ) : previewText ? (
             <pre
               style={{

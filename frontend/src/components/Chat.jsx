@@ -14,6 +14,7 @@ import {
   Modal,
   Checkbox,
   Alert,
+  Table,
   theme as antdTheme,
   Divider,
   Space,
@@ -86,6 +87,209 @@ const heroPrompts = [
   { title: 'Document Q&A', desc: 'Context aware chat', prompt: 'Summarize my latest uploaded document', icon: <FileTextTwoTone /> },
 ]
 
+const TABLE_PREVIEW_ROWS = 10
+
+const countPipes = (line) => (line.match(/\|/g) || []).length
+
+const looksLikeTableRow = (line) => {
+  const trimmed = (line || '').trim()
+  if (countPipes(trimmed) < 2) return false
+  const cells = trimmed.split('|').filter((cell) => cell.trim())
+  return cells.length >= 2
+}
+
+const isTableDivider = (line) => {
+  const trimmed = (line || '').trim()
+  if (countPipes(trimmed) < 2) return false
+  const cleaned = trimmed.replace(/\|/g, '').replace(/:/g, '').replace(/-/g, '').trim()
+  return cleaned === ''
+}
+
+const splitTableRow = (line) =>
+  (line || '')
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim())
+
+const parseMarkdownTableAt = (lines, startIndex) => {
+  const header = lines[startIndex]
+  const divider = lines[startIndex + 1]
+  if (!looksLikeTableRow(header) || !isTableDivider(divider)) return null
+  const rows = [splitTableRow(header)]
+  let idx = startIndex + 2
+  while (idx < lines.length && looksLikeTableRow(lines[idx])) {
+    rows.push(splitTableRow(lines[idx]))
+    idx += 1
+  }
+  return { rows, endIndex: idx }
+}
+
+const splitMessageBlocks = (content) => {
+  if (!content) return []
+  const lines = String(content).split(/\r?\n/)
+  const blocks = []
+  let buffer = []
+  let inCode = false
+
+  const flushBuffer = () => {
+    if (buffer.length === 0) return
+    blocks.push({ type: 'text', content: buffer.join('\n') })
+    buffer = []
+  }
+
+  for (let idx = 0; idx < lines.length; ) {
+    const line = lines[idx]
+    const trimmed = line.trim()
+    if (trimmed.startsWith('```')) {
+      if (!inCode) {
+        flushBuffer()
+        inCode = true
+        buffer.push(line)
+        idx += 1
+        continue
+      }
+      buffer.push(line)
+      blocks.push({ type: 'code', content: buffer.join('\n') })
+      buffer = []
+      inCode = false
+      idx += 1
+      continue
+    }
+
+    if (inCode) {
+      buffer.push(line)
+      idx += 1
+      continue
+    }
+
+    const table = parseMarkdownTableAt(lines, idx)
+    if (table) {
+      flushBuffer()
+      blocks.push({ type: 'table', rows: table.rows })
+      idx = table.endIndex
+      continue
+    }
+
+    buffer.push(line)
+    idx += 1
+  }
+
+  flushBuffer()
+  return blocks
+}
+
+const extractFirstTableRows = (content) => {
+  const blocks = splitMessageBlocks(content)
+  const tableBlock = blocks.find((block) => block.type === 'table')
+  return tableBlock?.rows || null
+}
+
+const buildTableModel = (rows) => {
+  if (!Array.isArray(rows) || rows.length === 0) return null
+  const normalized = rows.map((row) =>
+    Array.isArray(row) ? row.map((cell) => (cell ?? '').toString()) : []
+  )
+  if (normalized.length === 1) {
+    const row = normalized[0]
+    const colCount = Math.max(row.length, 1)
+    const columns = Array.from({ length: colCount }, (_, idx) => ({
+      title: `col_${idx + 1}`,
+      dataIndex: `col_${idx}`,
+      key: `col_${idx}`,
+      ellipsis: true,
+    }))
+    const dataSource = [
+      row.reduce(
+        (acc, cell, idx) => ({ ...acc, [`col_${idx}`]: cell ?? '' }),
+        { key: 'row_0' }
+      ),
+    ]
+    return { columns, dataSource, rowCount: dataSource.length, colCount }
+  }
+
+  let header = normalized[0] || []
+  let body = normalized.slice(1)
+  const headerEmpty = header.every((cell) => !String(cell).trim())
+  if (headerEmpty && body.length) {
+    header = body[0]
+    body = body.slice(1)
+  }
+
+  const colCount = Math.max(header.length, ...body.map((row) => row.length), 0)
+  if (colCount === 0) return null
+
+  const columns = Array.from({ length: colCount }, (_, idx) => ({
+    title: header[idx] || `col_${idx + 1}`,
+    dataIndex: `col_${idx}`,
+    key: `col_${idx}`,
+    ellipsis: true,
+  }))
+
+  const dataSource = body.map((row, rowIdx) => {
+    const record = { key: `row_${rowIdx}` }
+    for (let colIdx = 0; colIdx < colCount; colIdx += 1) {
+      record[`col_${colIdx}`] = row[colIdx] ?? ''
+    }
+    return record
+  })
+
+  return { columns, dataSource, rowCount: dataSource.length, colCount }
+}
+
+const TableBlock = ({ rows, maxPreviewRows = TABLE_PREVIEW_ROWS, defaultExpanded = false }) => {
+  const { token: antdToken } = antdTheme.useToken()
+  const [expanded, setExpanded] = useState(defaultExpanded)
+  const model = useMemo(() => buildTableModel(rows), [rows])
+
+  if (!model) {
+    return (
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        No table data.
+      </Text>
+    )
+  }
+
+  const { columns, dataSource, rowCount, colCount } = model
+  const canExpand = dataSource.length > maxPreviewRows
+  const visibleRows = expanded ? dataSource : dataSource.slice(0, maxPreviewRows)
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${antdToken.colorBorderSecondary}`,
+        borderRadius: 10,
+        background: antdToken.colorFillTertiary,
+        padding: 10,
+      }}
+    >
+      <Flex align="center" justify="space-between" wrap style={{ marginBottom: 8 }}>
+        <Flex align="center" gap={8}>
+          <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+            TABLE
+          </Tag>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {rowCount} rows · {colCount} cols
+          </Text>
+        </Flex>
+        {canExpand && (
+          <Button size="small" type="link" onClick={() => setExpanded((prev) => !prev)}>
+            {expanded ? '收起' : `展开 (${dataSource.length})`}
+          </Button>
+        )}
+      </Flex>
+      <Table
+        size="small"
+        columns={columns}
+        dataSource={visibleRows}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+      />
+    </div>
+  )
+}
+
 const MessageBubble = ({
   item,
   isSelected,
@@ -95,6 +299,7 @@ const MessageBubble = ({
   startStream,
   lastUserPrompt,
   renderSources,
+  renderContent,
   roleStyle,
   isError,
 }) => {
@@ -163,7 +368,9 @@ const MessageBubble = ({
             <Button size="small" type="text" icon={<DeleteOutlined />} onClick={() => deleteMessages(new Set([item.id]))} />
           </Tooltip>
         </Flex>
-        {item.content ? <Text style={{ color: isError ? antdToken.colorError : roleStyle.bubble.color }}>{item.content}</Text> : <Spin size="small" />}
+        {item.content
+          ? renderContent(item, { textColor: isError ? antdToken.colorError : roleStyle.bubble.color })
+          : <Spin size="small" />}
         {renderSources(item.sources)}
       </div>
     </Flex>
@@ -843,6 +1050,11 @@ export default function Chat({ token, userId, setUserId }) {
               typeof source.score === 'number'
                 ? ` (score ${source.score.toFixed(2)})`
                 : ''
+            const metadata = source.metadata || {}
+            const tableRows =
+              metadata.structure_type === 'table'
+                ? (Array.isArray(metadata.rows) ? metadata.rows : extractFirstTableRows(source.content))
+                : null
             return (
               <div
                 key={`${source.chunk_id || source.document_id || index}`}
@@ -859,17 +1071,68 @@ export default function Chat({ token, userId, setUserId }) {
                     {score || 'retrieved'}
                   </Text>
                 </Flex>
-                <Paragraph
-                  ellipsis={{ rows: 2, expandable: true, symbol: 'more' }}
-                  style={{ marginBottom: 0, color: antdToken.colorTextSecondary, fontSize: 13 }}
-                >
-                  {source.content || '(empty snippet)'}
-                </Paragraph>
+                {tableRows ? (
+                  <TableBlock rows={tableRows} />
+                ) : (
+                  <Paragraph
+                    ellipsis={{ rows: 2, expandable: true, symbol: 'more' }}
+                    style={{ marginBottom: 0, color: antdToken.colorTextSecondary, fontSize: 13 }}
+                  >
+                    {source.content || '(empty snippet)'}
+                  </Paragraph>
+                )}
               </div>
             )
           })}
         </Flex>
       </div>
+    )
+  }
+
+  const renderMessageContent = (item, { textColor }) => {
+    const blocks = splitMessageBlocks(item.content || '')
+    if (!blocks.length) {
+      return (
+        <Text style={{ color: textColor, whiteSpace: 'pre-wrap', display: 'block' }}>
+          {item.content}
+        </Text>
+      )
+    }
+
+    return (
+      <Flex vertical gap={8}>
+        {blocks.map((block, index) => {
+          const key = `${block.type}-${index}`
+          if (block.type === 'table') {
+            return <TableBlock key={key} rows={block.rows} />
+          }
+          const baseStyle = {
+            color: textColor,
+            whiteSpace: 'pre-wrap',
+            display: 'block',
+            margin: 0,
+          }
+          if (block.type === 'code') {
+            return (
+              <pre
+                key={key}
+                style={{
+                  ...baseStyle,
+                  fontFamily:
+                    'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                }}
+              >
+                {block.content}
+              </pre>
+            )
+          }
+          return (
+            <Text key={key} style={baseStyle}>
+              {block.content}
+            </Text>
+          )
+        })}
+      </Flex>
     )
   }
 
@@ -888,6 +1151,7 @@ export default function Chat({ token, userId, setUserId }) {
         startStream={startStream}
         lastUserPrompt={lastUserPrompt}
         renderSources={renderSources}
+        renderContent={renderMessageContent}
         roleStyle={roleStyle}
         isError={isError}
       />
