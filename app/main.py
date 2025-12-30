@@ -147,6 +147,7 @@ BLOCKED_KEYWORDS = [
     for keyword in (os.getenv("UPLOAD_BLOCKED_KEYWORDS") or "").split(",")
     if keyword.strip()
 ]
+MAX_CHAT_MESSAGE_CHARS = max(0, _parse_int_env("CHAT_MAX_MESSAGE_CHARS", 8000))
 
 
 class ChatReq(BaseModel):
@@ -154,6 +155,19 @@ class ChatReq(BaseModel):
     message: str
     user_id: Optional[str] = None
     remember: bool = False
+
+
+class ChatStreamReq(BaseModel):
+    session_id: str
+    message: str
+    user_id: Optional[str] = None
+    remember: bool = False
+
+
+class ChatContinueReq(BaseModel):
+    thread_id: str
+    action: str
+    user_id: Optional[str] = None
 
 
 class ChatResp(BaseModel):
@@ -417,6 +431,28 @@ def _assert_user_scope(user_id: str, token_subject: Optional[str]) -> None:
     if AUTH_SECRET_KEY and token_subject and token_subject != "static-token" and token_subject != user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token does not match user_id")
 
+def _sanitize_log_message(message: Optional[str], *, limit: int = 32) -> str:
+    if not message:
+        return ""
+    preview = message.replace("\n", " ").replace("\r", " ").strip()
+    if len(preview) > limit:
+        preview = preview[:limit] + "..."
+    return preview
+
+def _check_message_length(message: str) -> None:
+    if MAX_CHAT_MESSAGE_CHARS > 0 and len(message) > MAX_CHAT_MESSAGE_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Message too long.",
+        )
+
+def _require_thread_owner(thread_id: str, user_id: str) -> None:
+    thread = storage.get_chat_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Thread does not belong to user")
+
 def _resolve_tenant_id(request: Request, tenant_id: Optional[str] = None) -> str:
     candidate = (tenant_id or "").strip()
     if not candidate:
@@ -648,12 +684,27 @@ def _format_stream_payloads(
 
 @app.post("/chat", response_model=ChatResp)
 def chat(body: ChatReq, provided_token: str = Depends(enforce_rate_limit)) -> ChatResp:
-    logger.info("chat request session=%s message=%s", body.session_id, body.message)
+    preview = _sanitize_log_message(body.message)
+    logger.info(
+        "chat request session=%s user=%s message_len=%s preview=%s",
+        body.session_id,
+        body.user_id,
+        len(body.message or ""),
+        preview,
+    )
 
     user_id = _resolve_user_id(body.session_id, body.user_id, provided_token)
     _assert_user_scope(user_id, provided_token)
+    _require_thread_owner(body.session_id, user_id)
+    _check_message_length(body.message)
     try:
-        storage.ensure_chat_thread(user_id, thread_id=body.session_id, title=body.message[:80], last_message=body.message)
+        storage.ensure_chat_thread(
+            user_id,
+            thread_id=body.session_id,
+            title=body.message[:80],
+            last_message=body.message,
+            allow_create=False,
+        )
         storage.append_chat_message(body.session_id, user_id, "user", body.message)
     except Exception:
         logger.warning("chat history write failed session=%s user=%s", body.session_id, user_id, exc_info=True)
@@ -697,26 +748,32 @@ def _process_document_background(document_id: str, user_id: str, dest_path: Path
     )
 
 
-@app.get("/chat/stream")
-def chat_stream(
-    session_id: str,
-    message: str,
-    user_id: Optional[str] = None,
-    remember: Optional[str] = None,
-    provided_token: str = Depends(enforce_rate_limit),
-) -> StreamingResponse:
-    resolved_user = _resolve_user_id(session_id, user_id, provided_token)
+@app.post("/chat/stream")
+def chat_stream(body: ChatStreamReq, provided_token: str = Depends(enforce_rate_limit)) -> StreamingResponse:
+    session_id = body.session_id
+    message = body.message
+    resolved_user = _resolve_user_id(session_id, body.user_id, provided_token)
     _assert_user_scope(resolved_user, provided_token)
-    remember_flag = _parse_bool_flag(remember)
+    _require_thread_owner(session_id, resolved_user)
+    _check_message_length(message)
+    remember_flag = _parse_bool_flag(body.remember)
+    preview = _sanitize_log_message(message)
     logger.info(
-        "chat stream session=%s user=%s message=%s",
+        "chat stream session=%s user=%s message_len=%s preview=%s",
         session_id,
         resolved_user,
-        message,
+        len(message or ""),
+        preview,
     )
     title_hint = message[:80] if isinstance(message, str) else ""
     try:
-        storage.ensure_chat_thread(resolved_user, thread_id=session_id, title=title_hint, last_message=message)
+        storage.ensure_chat_thread(
+            resolved_user,
+            thread_id=session_id,
+            title=title_hint,
+            last_message=message,
+            allow_create=False,
+        )
         storage.append_chat_message(session_id, resolved_user, "user", message)
     except Exception:
         logger.warning("chat history write failed session=%s user=%s", session_id, resolved_user, exc_info=True)
@@ -741,11 +798,13 @@ def chat_stream(
                     for chunk in _format_stream_payloads(node, data, session_id, ai_state):
                         yield "data: " + json.dumps(_to_serializable(chunk), ensure_ascii=False) + "\n\n"
         except Exception as exc:  # pragma: no cover - SSE 仅做演示
+            preview = _sanitize_log_message(message)
             logger.exception(
-                "chat stream error session=%s user=%s message=%s exc=%s",
+                "chat stream error session=%s user=%s message_len=%s preview=%s exc=%s",
                 session_id,
                 resolved_user,
-                message,
+                len(message or ""),
+                preview,
                 exc,
             )
             if isinstance(exc, KeyError) and exc.args and exc.args[0] == "__end__":
@@ -774,14 +833,10 @@ def chat_stream(
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
-@app.get("/chat/continue")
-def chat_continue(
-    thread_id: str,
-    action: str,
-    user_id: Optional[str] = None,
-    provided_token: str = Depends(enforce_rate_limit),
-):
-    verb = action.strip().lower()
+@app.post("/chat/continue")
+def chat_continue(body: ChatContinueReq, provided_token: str = Depends(enforce_rate_limit)):
+    thread_id = body.thread_id
+    verb = (body.action or "").strip().lower()
     if verb not in {"continue", "cancel"}:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
@@ -793,15 +848,15 @@ def chat_continue(
 
     state_values = snapshot.values if isinstance(snapshot.values, dict) else {}
     resolved_user = _resolve_user_id(
-        thread_id, user_id or state_values.get("user_id"), provided_token  # type: ignore[arg-type]
+        thread_id, body.user_id or state_values.get("user_id"), provided_token  # type: ignore[arg-type]
     )
     _assert_user_scope(resolved_user, provided_token)
-    storage.ensure_chat_thread(resolved_user, thread_id=thread_id)
+    _require_thread_owner(thread_id, resolved_user)
     logger.info(
         "resume request received thread=%s user=%s action=%s",
         thread_id,
         resolved_user,
-        action,
+        body.action,
     )
     base_cfg = _build_graph_config(thread_id, resolved_user)
     plan: List[Dict[str, Any]] = state_values.get("plan", [])  # type: ignore[assignment]
@@ -946,10 +1001,11 @@ def create_chat_thread(payload: ThreadCreateReq, provided_token: str = Depends(e
     normalized_user = (payload.user_id or "").strip()
     if not normalized_user:
         raise HTTPException(status_code=400, detail="user_id is required")
+    if payload.thread_id:
+        raise HTTPException(status_code=400, detail="thread_id is server-generated")
     _assert_user_scope(normalized_user, provided_token)
     thread_id = storage.ensure_chat_thread(
         normalized_user,
-        thread_id=payload.thread_id,
         title=payload.title or "",
         last_message="",
     )

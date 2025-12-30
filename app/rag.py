@@ -141,11 +141,14 @@ class UserVectorStoreRetriever(BaseRetriever):
         for doc, distance in store.similarity_search_with_score(
             normalized, k=self.top_k
         ):
-            similarity = max(0.0, 1.0 - float(distance))
+            raw_distance = float(distance)
+            similarity = _faiss_distance_to_similarity(raw_distance)
             if similarity < self.min_score:
                 continue
             metadata = dict(doc.metadata or {})
             metadata["score"] = similarity
+            metadata["distance"] = raw_distance
+            metadata["score_method"] = "faiss_l2_squared_to_cosine"
             documents.append(
                 Document(
                     page_content=_format_snippet(doc.page_content),
@@ -312,6 +315,29 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     norm_a = math.sqrt(sum(x * x for x in a)) or 1e-9
     norm_b = math.sqrt(sum(y * y for y in b)) or 1e-9
     return dot / (norm_a * norm_b)
+
+
+def _faiss_distance_to_similarity(distance: float) -> float:
+    """
+    Convert LangChain FAISS "score" (L2 distance) into an approximate cosine similarity.
+
+    This project normalizes embeddings (see `_get_embedding_model()`), so for unit vectors:
+        ||a - b||^2 = 2 - 2*cos(a, b)  =>  cos(a, b) = 1 - (||a - b||^2)/2
+
+    FAISS `IndexFlatL2` returns squared L2 distances.
+    """
+    try:
+        d = float(distance)
+    except Exception:
+        return 0.0
+    if math.isnan(d) or math.isinf(d):
+        return 0.0
+    similarity = 1.0 - (d / 2.0)
+    if similarity < 0.0:
+        return 0.0
+    if similarity > 1.0:
+        return 1.0
+    return similarity
 
 
 def _legacy_similarity_scan(

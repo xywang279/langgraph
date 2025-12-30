@@ -923,19 +923,40 @@ def iter_published_chunks(user_id: str, tenant_id: Optional[str] = None) -> Iter
         }
 
 
-def ensure_chat_thread(user_id: str, *, thread_id: Optional[str] = None, title: str = "", last_message: str = "") -> str:
+def ensure_chat_thread(
+    user_id: str,
+    *,
+    thread_id: Optional[str] = None,
+    title: str = "",
+    last_message: str = "",
+    allow_create: bool = True,
+) -> str:
     """Create a chat thread if missing or update the metadata for an existing one."""
     upsert_user(user_id)
     tid = thread_id or uuid.uuid4().hex
+    if not allow_create and not tid:
+        raise ValueError("thread_id is required when creation is disabled.")
     now = time.time()
     conn = _get_connection()
     with _LOCK:
+        if thread_id:
+            row = conn.execute(
+                "SELECT user_id FROM chat_threads WHERE thread_id = ?",
+                (tid,),
+            ).fetchone()
+            if row:
+                existing_user = row["user_id"]
+                if existing_user != user_id:
+                    raise ValueError("Thread already belongs to a different user.")
+            elif not allow_create:
+                raise ValueError("Thread not found.")
+        elif not allow_create:
+            raise ValueError("Thread not found.")
         conn.execute(
             """
             INSERT INTO chat_threads (thread_id, user_id, title, last_message, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET
-                user_id = excluded.user_id,
                 title = CASE
                     WHEN excluded.title IS NOT NULL AND excluded.title != '' THEN excluded.title
                     ELSE chat_threads.title
@@ -961,7 +982,7 @@ def append_chat_message(
 ) -> str:
     if not thread_id or not user_id or not role:
         return ""
-    ensure_chat_thread(user_id, thread_id=thread_id)
+    ensure_chat_thread(user_id, thread_id=thread_id, allow_create=False)
     now = time.time()
     msg_id = uuid.uuid4().hex
     conn = _get_connection()
@@ -977,13 +998,11 @@ def append_chat_message(
         )
         conn.execute(
             """
-            INSERT INTO chat_threads (thread_id, user_id, title, last_message, created_at, updated_at)
-            VALUES (?, ?, '', ?, ?, ?)
-            ON CONFLICT(thread_id) DO UPDATE SET
-                last_message = excluded.last_message,
-                updated_at = excluded.updated_at
+            UPDATE chat_threads
+            SET last_message = ?, updated_at = ?
+            WHERE thread_id = ? AND user_id = ?
             """,
-            (thread_id, user_id, snippet[:500], now, now),
+            (snippet[:500], now, thread_id, user_id),
         )
         conn.commit()
     return msg_id
@@ -1005,6 +1024,22 @@ def list_chat_threads(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_chat_thread(thread_id: str) -> Optional[Dict[str, Any]]:
+    if not thread_id:
+        return None
+    conn = _get_connection()
+    with _LOCK:
+        row = conn.execute(
+            """
+            SELECT thread_id, user_id, title, last_message, created_at, updated_at
+            FROM chat_threads
+            WHERE thread_id = ?
+            """,
+            (thread_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def list_chat_messages(thread_id: str, user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
     conn = _get_connection()
     with _LOCK:
@@ -1014,11 +1049,12 @@ def list_chat_messages(thread_id: str, user_id: str, limit: int = 200) -> List[D
             FROM chat_messages m
             JOIN chat_threads t ON t.thread_id = m.thread_id
             WHERE m.thread_id = ? AND t.user_id = ?
-            ORDER BY m.created_at ASC
+            ORDER BY m.created_at DESC
             LIMIT ?
             """,
             (thread_id, user_id, max(1, limit)),
         ).fetchall()
+    rows = list(reversed(rows))
     items: List[Dict[str, Any]] = []
     for row in rows:
         meta = json.loads(row["metadata"]) if row["metadata"] else None

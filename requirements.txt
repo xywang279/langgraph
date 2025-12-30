@@ -6,6 +6,7 @@ requests==2.32.3
 celery==5.3.6
 redis==5.0.1
 boto3==1.34.145
+pytest==8.3.4
 
 
 # LangChain/LangGraph stack

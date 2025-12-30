@@ -35,7 +35,16 @@ import {
   PlusOutlined,
   EditOutlined,
 } from '@ant-design/icons'
-import { API_BASE, API_KEY, createThread, fetchThreadMessages, fetchThreads, deleteThread, renameThread } from '../api'
+import {
+  API_BASE,
+  API_KEY,
+  buildAuthHeaders,
+  createThread,
+  fetchThreadMessages,
+  fetchThreads,
+  deleteThread,
+  renameThread,
+} from '../api'
 
 const { Text, Paragraph } = Typography
 const { TextArea } = Input
@@ -87,7 +96,30 @@ const heroPrompts = [
   { title: 'Document Q&A', desc: 'Context aware chat', prompt: 'Summarize my latest uploaded document', icon: <FileTextTwoTone /> },
 ]
 
+const MAX_PROMPT_CHARS = 8000
 const TABLE_PREVIEW_ROWS = 10
+
+const splitSseEvents = (buffer) => {
+  const normalized = buffer.replace(/\r\n/g, '\n')
+  const parts = normalized.split('\n\n')
+  const rest = parts.pop() || ''
+  const events = []
+
+  for (const part of parts) {
+    if (!part) continue
+    const lines = part.split('\n')
+    const dataLines = lines.filter((line) => line.startsWith('data:'))
+    if (!dataLines.length) continue
+    const payload = dataLines.map((line) => line.slice(5).trimStart()).join('\n')
+    if (payload) {
+      events.push(payload)
+    }
+  }
+
+  return { events, rest }
+}
+
+export { splitSseEvents }
 
 const countPipes = (line) => (line.match(/\|/g) || []).length
 
@@ -395,7 +427,8 @@ export default function Chat({ token, userId, setUserId }) {
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [threadActionId, setThreadActionId] = useState(null)
 
-  const esRef = useRef(null)
+  const abortControllerRef = useRef(null)
+  const streamIdRef = useRef(0)
   const liveMessageRef = useRef(null)
   const lastResultRef = useRef({})
   const sourcesRef = useRef([])
@@ -450,14 +483,14 @@ export default function Chat({ token, userId, setUserId }) {
   }, [])
 
   const stopStream = useCallback(() => {
-    if (esRef.current) {
-      esRef.current.close()
-      esRef.current = null
-      setLoading(false)
-      setResumeLoading(false)
-      clearLiveMessage()
-      setSseNotice('stopped')
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
     }
+    setLoading(false)
+    setResumeLoading(false)
+    clearLiveMessage()
+    setSseNotice('stopped')
   }, [clearLiveMessage])
 
   const loadThreadMessages = useCallback(
@@ -779,49 +812,19 @@ export default function Chat({ token, userId, setUserId }) {
     [handlePlanEvent, handleStepUpdate, handleMessageChunk, finalizeLiveMessage, clearLiveMessage, refreshThreads]
   )
 
-  const attachEventSource = useCallback(
-    (es) => {
-      es.onmessage = (ev) => {
-        if (!ev?.data) return
-        try {
-          const parsed = JSON.parse(ev.data)
-          handleStreamEvent(parsed)
-        } catch (err) {
-          console.warn('failed to parse stream event', err)
-        }
+  const startStreamRequest = useCallback(
+    async ({ path, body, userMessage, resetPlan = false, expectStream = true }) => {
+      if (!path) return
+
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+        abortControllerRef.current = null
       }
 
-      es.onerror = () => {
-        setLoading(false)
-        setResumeLoading(false)
-        clearLiveMessage()
-        setSseNotice('error')
-        es.close()
-        esRef.current = null
-      }
-    },
-    [handleStreamEvent, clearLiveMessage]
-  )
-
-  const buildStreamUrl = useCallback(
-    (basePath, params) => {
-      const search = new URLSearchParams(params)
-      if (resolvedToken) {
-        search.set('api_key', resolvedToken)
-      }
-      return `${API_BASE}${basePath}?${search.toString()}`
-    },
-    [resolvedToken]
-  )
-
-  const initializeStream = useCallback(
-    ({ url, userMessage, resetPlan = false, expectStream = true }) => {
-      if (!url) return
-
-      if (esRef.current) {
-        esRef.current.close()
-        esRef.current = null
-      }
+      const controller = new AbortController()
+      abortControllerRef.current = controller
+      const streamId = streamIdRef.current + 1
+      streamIdRef.current = streamId
 
       if (resetPlan) {
         setPlanState(INITIAL_PLAN)
@@ -847,15 +850,106 @@ export default function Chat({ token, userId, setUserId }) {
         })
       }
 
-      const es = new EventSource(url)
-      esRef.current = es
-      attachEventSource(es)
-
       if (!expectStream) {
         setLoading(false)
       }
+
+      let resp
+      try {
+        resp = await fetch(`${API_BASE}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...buildAuthHeaders(resolvedToken) },
+          body: JSON.stringify(body || {}),
+          signal: controller.signal,
+        })
+      } catch (err) {
+        if (streamIdRef.current !== streamId) return
+        if (controller.signal.aborted) {
+          setSseNotice('stopped')
+          return
+        }
+        setLoading(false)
+        setResumeLoading(false)
+        setSseNotice('error')
+        clearLiveMessage()
+        antdMessage.error('Stream interrupted or failed.')
+        return
+      }
+
+      if (streamIdRef.current !== streamId) return
+      if (controller.signal.aborted) return
+
+      if (!resp.ok) {
+        let detail = ''
+        try {
+          const data = await resp.json()
+          detail = data?.detail || data?.message || JSON.stringify(data)
+        } catch (err) {
+          detail = (await resp.text()) || ''
+        }
+        const status = resp.status
+        if (status === 401 || status === 403) {
+          antdMessage.error('Authentication expired. Please log in again.')
+        } else if (status === 413) {
+          antdMessage.error(detail || 'Message too long.')
+        } else {
+          antdMessage.error(detail || `Stream failed (${status}).`)
+        }
+        setLoading(false)
+        setResumeLoading(false)
+        setSseNotice('error')
+        clearLiveMessage()
+        return
+      }
+
+      if (!resp.body) {
+        setLoading(false)
+        setResumeLoading(false)
+        setSseNotice('error')
+        clearLiveMessage()
+        antdMessage.error('Stream unavailable.')
+        return
+      }
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          if (streamIdRef.current !== streamId) return
+          buffer += decoder.decode(value, { stream: true })
+          const { events, rest } = splitSseEvents(buffer)
+          buffer = rest
+          for (const payload of events) {
+            try {
+              const parsed = JSON.parse(payload)
+              handleStreamEvent(parsed)
+            } catch (err) {
+              console.warn('failed to parse stream event', err)
+            }
+          }
+        }
+      } catch (err) {
+        if (streamIdRef.current !== streamId) return
+        if (controller.signal.aborted) {
+          setSseNotice('stopped')
+          return
+        }
+        setLoading(false)
+        setResumeLoading(false)
+        setSseNotice('error')
+        clearLiveMessage()
+        antdMessage.error('Stream interrupted or failed.')
+      } finally {
+        if (streamIdRef.current === streamId) {
+          abortControllerRef.current = null
+        }
+      }
     },
-    [attachEventSource]
+    [clearLiveMessage, handleStreamEvent, resolvedToken]
   )
 
   const startStream = useCallback(
@@ -864,6 +958,10 @@ export default function Chat({ token, userId, setUserId }) {
       const prompt = (promptValue || '').trim()
       if (!prompt) {
         antdMessage.warning('Please enter a prompt')
+        return
+      }
+      if (prompt.length > MAX_PROMPT_CHARS) {
+        antdMessage.warning(`Message too long (>${MAX_PROMPT_CHARS} chars). Please shorten it.`)
         return
       }
 
@@ -888,15 +986,14 @@ export default function Chat({ token, userId, setUserId }) {
         return
       }
 
-      const url = buildStreamUrl('/chat/stream', {
-        session_id: threadId,
-        user_id: userId,
-        message: prompt,
-        remember: rememberNext ? '1' : '0',
-      })
-
-      initializeStream({
-        url,
+      startStreamRequest({
+        path: '/chat/stream',
+        body: {
+          session_id: threadId,
+          user_id: userId,
+          message: prompt,
+          remember: Boolean(rememberNext),
+        },
         userMessage: prompt,
         resetPlan: true,
         expectStream: true,
@@ -910,7 +1007,7 @@ export default function Chat({ token, userId, setUserId }) {
         setRememberNext(false)
       }
     },
-    [text, userId, sessionId, rememberNext, initializeStream, buildStreamUrl, startNewThread]
+    [text, userId, sessionId, rememberNext, startStreamRequest, startNewThread]
   )
 
   const resendLast = useCallback(() => {
@@ -989,34 +1086,30 @@ export default function Chat({ token, userId, setUserId }) {
       if (!sessionId) return
       if (!['continue', 'cancel'].includes(action)) return
 
-      const url = buildStreamUrl('/chat/continue', {
-        thread_id: sessionId,
-        action,
-        user_id: userId,
-        nonce: Date.now(),
-      })
-
       setInterruptVisible(false)
       setInterruptInfo(null)
 
       if (action === 'continue') {
         setLoading(true)
         setResumeLoading(true)
-        initializeStream({
-          url,
+        setSseNotice('streaming')
+        startStreamRequest({
+          path: '/chat/continue',
+          body: { thread_id: sessionId, action, user_id: userId },
           resetPlan: false,
           expectStream: true,
         })
       } else {
         setResumeLoading(true)
-        initializeStream({
-          url,
+        startStreamRequest({
+          path: '/chat/continue',
+          body: { thread_id: sessionId, action, user_id: userId },
           resetPlan: false,
           expectStream: false,
         })
       }
     },
-    [sessionId, userId, initializeStream, buildStreamUrl]
+    [sessionId, userId, startStreamRequest]
   )
 
   useEffect(() => {
