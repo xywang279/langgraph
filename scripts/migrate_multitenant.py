@@ -1,29 +1,56 @@
+import argparse
 import sqlite3
+import sys
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "langgraph.sqlite3"
+SCRIPTS_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = SCRIPTS_DIR.parent / "data" / "langgraph.sqlite3"
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from migrations.db_utils import connect_db
+from migrations.multitenant import run as run_multitenant
 
 
-def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == column for row in cur.fetchall())
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Migrate tenant_id columns.")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=DEFAULT_DB_PATH,
+        help=f"Path to SQLite DB (default: {DEFAULT_DB_PATH})",
+    )
+    return parser.parse_args()
 
 
-def main():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    with conn:
-        if not column_exists(conn, "documents", "tenant_id"):
-            conn.execute("ALTER TABLE documents ADD COLUMN tenant_id TEXT")
-        if not column_exists(conn, "chunks", "tenant_id"):
-            conn.execute("ALTER TABLE chunks ADD COLUMN tenant_id TEXT")
-        if not column_exists(conn, "vector_stats", "tenant_id"):
-            conn.execute("ALTER TABLE vector_stats ADD COLUMN tenant_id TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id)")
+def main() -> int:
+    args = parse_args()
+    db_path = args.db
+    if not db_path.exists():
+        print(f"DB not found at {db_path}", file=sys.stderr)
+        return 1
+    try:
+        conn = connect_db(db_path)
+    except sqlite3.Error as exc:
+        print(f"Failed to connect to DB: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with conn:
+            changes = run_multitenant(conn)
+    except sqlite3.Error as exc:
+        print(f"Migration failed: {exc}", file=sys.stderr)
+        return 1
+
+    if changes:
         print("Migration completed.")
+        for change in changes:
+            print(f"- {change}")
+    else:
+        print("Migration completed. No changes needed.")
+    return 0
 
 
 if __name__ == "__main__":
-    if not DB_PATH.exists():
-        raise SystemExit(f"DB not found at {DB_PATH}")
-    main()
+    raise SystemExit(main())

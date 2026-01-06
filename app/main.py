@@ -34,6 +34,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Interrupt
 from pydantic import BaseModel
 from starlette import status
+from starlette.concurrency import run_in_threadpool
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -82,6 +83,8 @@ app.add_middleware(
 
 DOCS_ROOT = Path(__file__).resolve().parent.parent / "docs"
 DOCS_ROOT.mkdir(parents=True, exist_ok=True)
+PIPELINE_ROOT = Path(__file__).resolve().parent.parent / "data" / "pipeline"
+PIPELINE_ROOT.mkdir(parents=True, exist_ok=True)
 DEFAULT_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "40"))
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
 try:
@@ -477,6 +480,13 @@ def _parse_bool_flag(value: Optional[Any]) -> bool:
 def _sanitize_user_folder(user_id: str) -> Path:
     safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in user_id) or '_default'
     folder = DOCS_ROOT / safe
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _sanitize_pipeline_folder(user_id: str) -> Path:
+    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in user_id) or '_default'
+    folder = PIPELINE_ROOT / safe
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
@@ -1104,6 +1114,165 @@ async def upload_document(
         len(content),
     )
     return {"id": document_id, "status": "processing"}
+
+
+@app.post("/pipelines/questions", status_code=status.HTTP_200_OK)
+async def run_question_pipeline(
+    request: Request,
+    user_id: str = Form(...),
+    tenant_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    subject: Optional[str] = Form(None),
+    year: Optional[int] = Form(None),
+    grade: Optional[str] = Form(None),
+    dpi: int = Form(300),
+    ocr_lang: str = Form("chi_sim+eng"),
+    render_page_when_empty: Optional[bool] = Form(True),
+    crop_questions: Optional[bool] = Form(True),
+    preprocess: Optional[bool] = Form(False),
+    preprocess_denoise: Optional[bool] = Form(False),
+    preprocess_binarize: Optional[bool] = Form(False),
+    preprocess_sharpen: Optional[bool] = Form(False),
+    preprocess_deskew: Optional[bool] = Form(False),
+    save_preprocessed: Optional[bool] = Form(False),
+    doc_meta_pages: int = Form(2),
+    ocr_min_conf: float = Form(0.7),
+    seg_min_conf: float = Form(0.6),
+    min_stem_chars: int = Form(20),
+    run_enrich: Optional[bool] = Form(True),
+    enrich_mode: str = Form("review"),
+    enrich_min_ocr_conf: float = Form(0.7),
+    enrich_min_seg_conf: float = Form(0.6),
+    enrich_max_items: Optional[int] = Form(None),
+    enrich_temperature: float = Form(0.2),
+    enrich_max_retries: int = Form(2),
+    enrich_sleep_seconds: float = Form(0.0),
+    run_ingest: Optional[bool] = Form(True),
+    publish: Optional[bool] = Form(True),
+    document_id: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),
+    provided_token: str = Depends(enforce_rate_limit),
+):
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    _assert_user_scope(normalized_user, provided_token)
+    resolved_tenant = _resolve_tenant_id(request, tenant_id)
+
+    filename = _safe_filename(file.filename)
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported for this pipeline.")
+
+    content = await file.read()
+    _validate_upload(file, content)
+
+    run_enrich_flag = _parse_bool_flag(run_enrich)
+    run_ingest_flag = _parse_bool_flag(run_ingest)
+    render_page_flag = _parse_bool_flag(render_page_when_empty)
+    crop_questions_flag = _parse_bool_flag(crop_questions)
+    preprocess_flag = _parse_bool_flag(preprocess)
+    preprocess_denoise_flag = _parse_bool_flag(preprocess_denoise)
+    preprocess_binarize_flag = _parse_bool_flag(preprocess_binarize)
+    preprocess_sharpen_flag = _parse_bool_flag(preprocess_sharpen)
+    preprocess_deskew_flag = _parse_bool_flag(preprocess_deskew)
+    save_preprocessed_flag = _parse_bool_flag(save_preprocessed)
+    publish_flag = _parse_bool_flag(publish)
+
+    def _run_pipeline() -> Dict[str, Any]:
+        from scripts.pdf_to_questions import configure_tesseract, pdf_to_questions
+        from scripts.enrich_questions import enrich_questions
+        from scripts.ingest_questions import ingest_questions
+
+        job_id = uuid.uuid4().hex
+        pipeline_dir = _sanitize_pipeline_folder(normalized_user) / job_id
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = pipeline_dir / f"{job_id}_{filename}"
+        pdf_path.write_bytes(content)
+
+        preprocess_enabled = preprocess_flag or any(
+            [
+                preprocess_denoise_flag,
+                preprocess_binarize_flag,
+                preprocess_sharpen_flag,
+                preprocess_deskew_flag,
+            ]
+        )
+
+        configure_tesseract()
+        extract_result = pdf_to_questions(
+            pdf_path,
+            pipeline_dir,
+            dpi=dpi,
+            render_if_empty=render_page_flag,
+            crop_questions=crop_questions_flag,
+            ocr_lang=ocr_lang,
+            preprocess=preprocess_enabled,
+            preprocess_denoise=preprocess_denoise_flag or preprocess_enabled,
+            preprocess_binarize=preprocess_binarize_flag or preprocess_enabled,
+            preprocess_sharpen=preprocess_sharpen_flag or preprocess_enabled,
+            preprocess_deskew=preprocess_deskew_flag or preprocess_enabled,
+            save_preprocessed=save_preprocessed_flag,
+            doc_meta_pages=doc_meta_pages,
+            subject=subject,
+            year=year,
+            grade=grade,
+            ocr_min_conf=ocr_min_conf,
+            seg_min_conf=seg_min_conf,
+            min_stem_chars=min_stem_chars,
+        )
+
+        enrich_result = None
+        enrich_error = None
+        if run_enrich_flag:
+            try:
+                enrich_result = enrich_questions(
+                    core_path=Path(extract_result["core_questions_file"]),
+                    mode=enrich_mode,
+                    min_ocr_conf=enrich_min_ocr_conf,
+                    min_seg_conf=enrich_min_seg_conf,
+                    max_items=enrich_max_items,
+                    temperature=enrich_temperature,
+                    max_retries=enrich_max_retries,
+                    sleep_seconds=enrich_sleep_seconds,
+                )
+            except Exception as exc:
+                enrich_error = str(exc)
+
+        ingest_result = None
+        ingest_error = None
+        if run_ingest_flag:
+            try:
+                md_path = Path(extract_result["markdown_file"])
+                doc_title = (title or "").strip() or f"{pdf_path.stem}.questions.md"
+                ingest_result = ingest_questions(
+                    md_path=md_path,
+                    user_id=normalized_user,
+                    tenant_id=resolved_tenant,
+                    document_id=document_id,
+                    title=doc_title,
+                    publish=publish_flag,
+                )
+            except Exception as exc:
+                ingest_error = str(exc)
+
+        return {
+            "job_id": job_id,
+            "source_pdf": str(pdf_path),
+            "output_dir": str(pipeline_dir),
+            "extract": extract_result,
+            "enrich": enrich_result,
+            "enrich_error": enrich_error,
+            "ingest": ingest_result,
+            "ingest_error": ingest_error,
+        }
+
+    try:
+        return await run_in_threadpool(_run_pipeline)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("question pipeline failed user=%s err=%s", normalized_user, exc)
+        raise HTTPException(status_code=500, detail="Question pipeline failed.") from exc
 
 
 @app.post("/documents/{document_id}/versions/upload", status_code=status.HTTP_202_ACCEPTED)
